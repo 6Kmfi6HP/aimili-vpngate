@@ -1,0 +1,10 @@
+{
+  "host": "::",
+  "port": 8787,
+  "proxy_port": 7928,
+  "secret_path": "FixtureSecret12",
+  "username": "admin",
+  "password": "FixturePass123",
+  "routing_mode": "auto",
+  "force_country": ""
+}

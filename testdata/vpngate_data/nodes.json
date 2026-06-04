@@ -1,0 +1,17 @@
+[
+  {
+    "id": "jp-198-51-100-10",
+    "country": "JP",
+    "country_long": "Japan",
+    "ip": "198.51.100.10",
+    "hostname": "sample-vpn",
+    "ping": 42,
+    "speed": 987654,
+    "score": 12345,
+    "config_file": "vpngate_data/configs/jp-198-51-100-10.ovpn",
+    "remote_host": "198.51.100.10",
+    "remote_port": 443,
+    "remote_proto": "tcp",
+    "probe_status": "ok"
+  }
+]

@@ -24,7 +24,7 @@ build/
 *.egg
 
 # ---- 运行时数据 ----
-vpngate_data/
+/vpngate_data/
 logs/
 *.log
 *.tmp

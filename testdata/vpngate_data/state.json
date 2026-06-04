@@ -1,0 +1,13 @@
+{
+  "api_url": "https://www.vpngate.net/api/iphone/",
+  "target_valid_nodes": 3,
+  "fetch_interval_seconds": 960,
+  "check_interval_seconds": 960,
+  "local_proxy": "http://127.0.0.1:7928",
+  "active_openvpn_node_id": "",
+  "last_fetch_status": "ok",
+  "last_check_message": "fixture state",
+  "is_connecting": false,
+  "active_node_latency": "not connected",
+  "blacklisted_nodes": 0
+}
