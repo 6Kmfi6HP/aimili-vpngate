@@ -4,6 +4,79 @@ Bilingual: [中文](#中文) | [English](#english)
 
 ---
 
+## Go / Docker Release Preview
+
+AimiliVPN is migrating from the legacy Python runtime to a Go service binary with native Linux, Docker Compose, and GitHub Release distribution.
+
+- Native binary: `aimilivpn serve`
+- Management helper: `aimilivpnctl`, with installer-created `ml` compatibility
+- Native data directory: `/opt/aimilivpn/vpngate_data`
+- Container data directory: `/data`
+- Default management UI port: `8787`
+- Default local proxy port: `7928`
+- Native proxy default: `127.0.0.1:7928`
+- Docker Compose host binding default: `127.0.0.1:8787` and `127.0.0.1:7928`
+
+Quick Docker start:
+
+```bash
+docker compose up -d --build
+```
+
+Quick native install from this repository checkout:
+
+```bash
+sudo bash install.sh install --mode native
+```
+
+Quick Docker install:
+
+```bash
+sudo bash install.sh install --mode docker
+```
+
+Migration and deployment docs:
+
+- [Go runtime checklist](docs/migration/go-runtime-checklist.md)
+- [Native packaging](docs/migration/native-packaging.md)
+- [Docker deployment](docs/migration/docker-deployment.md)
+- [Python to Go migration](docs/migration/python-to-go.md)
+- [Release assets](docs/migration/release-assets.md)
+- [Smoke tests](docs/migration/smoke-tests.md)
+
+## Go / Docker 版本预览
+
+AimiliVPN 正在从旧 Python 运行时迁移到 Go 服务二进制，并提供原生 Linux、Docker Compose 和 GitHub Release 分发方式。
+
+- 原生服务：`aimilivpn serve`
+- 管理命令：`aimilivpnctl`，安装器会保留 `ml` 兼容入口
+- 原生数据目录：`/opt/aimilivpn/vpngate_data`
+- 容器数据目录：`/data`
+- 默认管理端口：`8787`
+- 默认本地代理端口：`7928`
+- 原生代理默认绑定：`127.0.0.1:7928`
+- Docker Compose 默认宿主机绑定：`127.0.0.1:8787` 和 `127.0.0.1:7928`
+
+Docker 快速启动：
+
+```bash
+docker compose up -d --build
+```
+
+从当前仓库原生安装：
+
+```bash
+sudo bash install.sh install --mode native
+```
+
+Docker 模式安装：
+
+```bash
+sudo bash install.sh install --mode docker
+```
+
+---
+
 <a name="中文"></a>
 ## 中文 (Chinese)
 

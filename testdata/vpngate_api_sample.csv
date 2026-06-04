@@ -1,0 +1,4 @@
+*vpn_servers
+HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64
+sample-vpn,198.51.100.10,12345,42,987654,Japan,JP,12,34567,100,2000000,2,Example,Fixture,Y2xpZW50CnByb3RvIHRjcApyZW1vdGUgMTk4LjUxLjEwMC4xMCA0NDMKcmVzb2x2LXJldHJ5IGluZmluaXRlCmF1dGgtdXNlci1wYXNzCg==
+*

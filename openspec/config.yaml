@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  Project: AimiliVPN, a zero-dependency Python 3 VPNGate/OpenVPN proxy gateway.
+  Runtime: Linux VPS, usually root, with OpenVPN, iproute/iptables, systemd or OpenRC.
+  Core files: vpngate_manager.py is the manager and web UI; proxy_server.py serves HTTP/SOCKS5 proxy traffic; vpn_utils.py contains VPNGate parsing, network utilities, and route helpers; install.sh bootstraps deployments.
+  Product shape: bilingual README, built-in management web UI, concurrent VPNGate node discovery/testing, auto/fixed route modes, local proxy defaulting to 127.0.0.1:7928, and management UI defaulting to port 8787.
+  Constraints: keep runtime dependencies in the Python standard library unless a proposal explicitly justifies otherwise; preserve Linux distro support; treat public proxy exposure, credentials, tun/tap, DNS, routing, and firewall changes as security-sensitive.
+
+rules:
+  proposal:
+    - Include user impact, operational impact, and non-goals for changes that affect install, routing, proxy binding, or authentication.
+  specs:
+    - Write requirements with SHALL statements and concrete scenarios.
+    - Cover security and failure-mode scenarios when changes touch network exposure, credentials, VPN process control, DNS, routing, or system services.
+  design:
+    - Explain compatibility with existing zero-dependency Python and Linux service assumptions.
+  tasks:
+    - Include focused verification steps such as syntax checks, targeted smoke tests, and manual service/runtime checks when relevant.

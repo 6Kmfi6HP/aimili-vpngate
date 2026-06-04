@@ -1,0 +1,27 @@
+services:
+  aimilivpn:
+    build:
+      context: .
+    image: ghcr.io/6kmfi6hp/aimili-vpngate:latest
+    container_name: aimilivpn
+    restart: unless-stopped
+    environment:
+      AIMILIVPN_CONTAINER: "true"
+      VPNGATE_DATA_DIR: /data
+      UI_HOST: 0.0.0.0
+      UI_PORT: "8787"
+      LOCAL_PROXY_HOST: 0.0.0.0
+      LOCAL_PROXY_PORT: "7928"
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:7928:7928"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - aimilivpn-data:/data
+
+volumes:
+  aimilivpn-data:

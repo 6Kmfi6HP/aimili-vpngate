@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+description="AimiliVPN Go VPNGate/OpenVPN Manager"
+command="/opt/aimilivpn/bin/aimilivpn"
+command_args="serve"
+command_background="yes"
+directory="/opt/aimilivpn"
+pidfile="/run/aimilivpn.pid"
+output_log="/opt/aimilivpn/vpngate_data/vpngate.log"
+error_log="/opt/aimilivpn/vpngate_data/vpngate.log"
+
+depend() {
+    need net
+    after firewall
+}

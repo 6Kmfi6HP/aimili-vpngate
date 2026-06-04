@@ -7,7 +7,7 @@ vpngate_manager.build/
 vpngate_manager.dist/
 *.build/
 *.dist/
-aimilivpn
+/aimilivpn
 
 # ---- Debian 打包产物 ----
 *.deb

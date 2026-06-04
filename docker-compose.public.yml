@@ -1,0 +1,8 @@
+# Opt-in public exposure override.
+# This publishes the management UI and proxy on every host interface.
+# Use firewall rules and strong UI credentials before enabling it.
+services:
+  aimilivpn:
+    ports:
+      - "0.0.0.0:8787:8787"
+      - "0.0.0.0:7928:7928"

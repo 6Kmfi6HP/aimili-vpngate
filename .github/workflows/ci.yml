@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - bate
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Set up Node for OpenSpec
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install OpenSpec
+        run: npm install -g @fission-ai/openspec@1.4.1
+
+      - name: Check Go formatting
+        run: |
+          files="$(gofmt -l cmd internal)"
+          test -z "$files" || { echo "$files"; exit 1; }
+
+      - name: Go tests
+        run: go test ./...
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Build binaries
+        run: |
+          go build ./cmd/aimilivpn
+          go build ./cmd/aimilivpnctl
+
+      - name: Installer checks
+        run: |
+          bash -n install.sh
+          bash scripts/test-install.sh
+
+      - name: OpenSpec validation
+        run: openspec validate migrate-to-go-docker-release
+
+      - name: Docker build
+        run: docker build -t aimilivpn:ci .
+
+      - name: Compose config
+        run: docker compose config
