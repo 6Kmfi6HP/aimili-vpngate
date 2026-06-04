@@ -53,6 +53,9 @@ func TestStateAndLogs(t *testing.T) {
 	if len(logs) != 1 || logs[0].Message != "hello" {
 		t.Fatalf("unexpected logs: %#v", logs)
 	}
+	if logs[0].Timestamp == "" {
+		t.Fatalf("timestamp not set: %#v", logs[0])
+	}
 }
 
 func TestFixtureUIConfigCompatibility(t *testing.T) {
@@ -75,4 +78,53 @@ func TestFixtureUIConfigCompatibility(t *testing.T) {
 	if cfg.SecretPath != "FixtureSecret12" || cfg.Username != "admin" {
 		t.Fatalf("fixture not loaded: %#v", cfg)
 	}
+}
+
+func TestSaveUIConfigPreservesUnknownFields(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	initial := `{
+  "host": "::",
+  "port": 8787,
+  "proxy_port": 7928,
+  "secret_path": "secret",
+  "username": "admin",
+  "password": "old",
+  "routing_mode": "fixed_region",
+  "force_country": "JP",
+  "fixed_node_id": "node-1",
+  "future_field": "keep"
+}
+`
+	if err := os.WriteFile(store.UIConfigFile(), []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.LoadUIConfig("::", 8787, 7928)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Password = "new"
+	if err := store.SaveUIConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.UIConfigFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"routing_mode": "fixed_region"`, `"force_country": "JP"`, `"fixed_node_id": "node-1"`, `"future_field": "keep"`, `"password": "new"`} {
+		if !containsString(string(raw), want) {
+			t.Fatalf("saved config missing %s:\n%s", want, raw)
+		}
+	}
+}
+
+func containsString(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

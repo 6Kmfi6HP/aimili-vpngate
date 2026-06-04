@@ -2,12 +2,15 @@ package vpngate
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -19,19 +22,32 @@ import (
 type Node struct {
 	ID           string `json:"id"`
 	Country      string `json:"country"`
-	CountryLong  string `json:"country_long,omitempty"`
+	CountryShort string `json:"country_short"`
+	CountryLong  string `json:"country_long"`
 	IP           string `json:"ip"`
-	HostName     string `json:"hostname,omitempty"`
+	HostName     string `json:"host_name"`
+	Hostname     string `json:"hostname"`
 	Ping         int    `json:"ping"`
-	Speed        int64  `json:"speed,omitempty"`
-	Score        int    `json:"score,omitempty"`
+	Speed        int64  `json:"speed"`
+	Score        int    `json:"score"`
+	Sessions     int    `json:"sessions"`
+	Owner        string `json:"owner"`
+	ASN          string `json:"asn"`
+	ASName       string `json:"as_name"`
+	Location     string `json:"location"`
+	IPType       string `json:"ip_type"`
+	Quality      string `json:"quality"`
+	LatencyMS    int    `json:"latency_ms"`
 	ConfigText   string `json:"config_text,omitempty"`
 	ConfigFile   string `json:"config_file,omitempty"`
-	RemoteHost   string `json:"remote_host,omitempty"`
-	RemotePort   int    `json:"remote_port,omitempty"`
-	RemoteProto  string `json:"remote_proto,omitempty"`
-	ProbeStatus  string `json:"probe_status,omitempty"`
-	ProbeMessage string `json:"probe_message,omitempty"`
+	Proto        string `json:"proto"`
+	RemoteHost   string `json:"remote_host"`
+	RemotePort   int    `json:"remote_port"`
+	RemoteProto  string `json:"remote_proto"`
+	ProbeStatus  string `json:"probe_status"`
+	ProbeMessage string `json:"probe_message"`
+	FetchedAt    int64  `json:"fetched_at"`
+	ProbedAt     int64  `json:"probed_at"`
 	InvalidUntil int64  `json:"invalid_until,omitempty"`
 	Active       bool   `json:"active,omitempty"`
 	LastError    string `json:"last_error,omitempty"`
@@ -43,28 +59,120 @@ type Client struct {
 }
 
 func (c Client) Fetch(ctx context.Context) ([]Node, error) {
-	client := c.HTTP
+	attempts := c.fetchAttempts()
+	var messages []string
+	for _, attempt := range attempts {
+		text, err := c.fetchText(ctx, attempt)
+		if err == nil {
+			return ParseAPI(text)
+		}
+		messages = append(messages, attempt.label+": "+err.Error())
+	}
+	return nil, fmt.Errorf("%s: %s", diagnoseFetch(messages), strings.Join(messages, " | "))
+}
+
+type fetchAttempt struct {
+	label      string
+	url        string
+	insecure   bool
+	proxyURL   *url.URL
+	baseClient *http.Client
+}
+
+func (c Client) fetchText(ctx context.Context, attempt fetchAttempt) (string, error) {
+	client := attempt.baseClient
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL, nil)
+	if attempt.proxyURL != nil || attempt.insecure {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if attempt.proxyURL != nil {
+			transport.Proxy = http.ProxyURL(attempt.proxyURL)
+		}
+		if attempt.insecure {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+		}
+		client = &http.Client{Timeout: client.Timeout, Transport: transport}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, attempt.url, nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	req.Header.Set("User-Agent", "AimiliVPN-Go/1.0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("vpngate api status %s", resp.Status)
+		return "", fmt.Errorf("vpngate api status %s", resp.Status)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return ParseAPI(string(raw))
+	return string(raw), nil
+}
+
+func (c Client) fetchAttempts() []fetchAttempt {
+	apiURL := c.APIURL
+	if apiURL == "" {
+		apiURL = "https://www.vpngate.net/api/iphone/"
+	}
+	var attempts []fetchAttempt
+	if proxyURL := upstreamProxyURL(); proxyURL != nil {
+		attempts = append(attempts, fetchAttempt{label: "upstream proxy", url: apiURL, proxyURL: proxyURL, baseClient: c.HTTP})
+	}
+	attempts = append(attempts, fetchAttempt{label: "https", url: apiURL, baseClient: c.HTTP})
+	if strings.HasPrefix(apiURL, "https://") {
+		attempts = append(attempts, fetchAttempt{label: "https insecure", url: apiURL, insecure: true, baseClient: c.HTTP})
+		attempts = append(attempts, fetchAttempt{label: "http fallback", url: "http://" + strings.TrimPrefix(apiURL, "https://"), baseClient: c.HTTP})
+	}
+	return attempts
+}
+
+func upstreamProxyURL() *url.URL {
+	for _, name := range []string{"OPENVPN_UPSTREAM_SOCKS", "OPENVPN_UPSTREAM_HTTP", "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"} {
+		value := strings.TrimSpace(getenv(name))
+		if value == "" {
+			continue
+		}
+		if !strings.Contains(value, "://") {
+			if strings.Contains(strings.ToLower(name), "socks") {
+				value = "socks5://" + value
+			} else {
+				value = "http://" + value
+			}
+		}
+		parsed, err := url.Parse(value)
+		if err == nil && parsed.Host != "" {
+			if parsed.Scheme == "socks" {
+				parsed.Scheme = "socks5"
+			}
+			return parsed
+		}
+	}
+	return nil
+}
+
+func getenv(name string) string {
+	return strings.TrimSpace(strings.ReplaceAll(strings.TrimSpace(os.Getenv(name)), "\n", ""))
+}
+
+func diagnoseFetch(messages []string) string {
+	joined := strings.ToLower(strings.Join(messages, " "))
+	switch {
+	case strings.Contains(joined, "no such host"):
+		return "[ERR_LOCAL_DNS_BROKEN]"
+	case strings.Contains(joined, "certificate") || strings.Contains(joined, "tls"):
+		return "[ERR_API_TLS_INTERFERENCE]"
+	case strings.Contains(joined, "timeout") || strings.Contains(joined, "i/o timeout"):
+		return "[ERR_API_IP_BLOCKED_OR_DOWN]"
+	case strings.Contains(joined, "connection refused"):
+		return "[ERR_API_IP_BLOCKED_OR_DOWN]"
+	default:
+		return "[ERR_API_FETCH_FAILED]"
+	}
 }
 
 func ParseAPI(text string) ([]Node, error) {
@@ -105,18 +213,26 @@ func ParseAPI(text string) ([]Node, error) {
 		}
 		configText := string(decoded)
 		host, port, proto := ParseRemote(configText, field(record, header, "IP"))
+		ping := atoi(field(record, header, "Ping"))
 		node := Node{
-			Country:     field(record, header, "CountryShort"),
-			CountryLong: field(record, header, "CountryLong"),
-			IP:          field(record, header, "IP"),
-			HostName:    field(record, header, "HostName"),
-			Ping:        atoi(field(record, header, "Ping")),
-			Speed:       int64(atoi(field(record, header, "Speed"))),
-			Score:       atoi(field(record, header, "Score")),
-			ConfigText:  configText,
-			RemoteHost:  host,
-			RemotePort:  port,
-			RemoteProto: proto,
+			Country:      field(record, header, "CountryShort"),
+			CountryShort: field(record, header, "CountryShort"),
+			CountryLong:  field(record, header, "CountryLong"),
+			IP:           field(record, header, "IP"),
+			HostName:     field(record, header, "HostName"),
+			Hostname:     field(record, header, "HostName"),
+			Ping:         ping,
+			Speed:        int64(atoi(field(record, header, "Speed"))),
+			Score:        atoi(field(record, header, "Score")),
+			Sessions:     atoi(field(record, header, "NumVpnSessions")),
+			LatencyMS:    ping,
+			ConfigText:   configText,
+			Proto:        proto,
+			RemoteHost:   host,
+			RemotePort:   port,
+			RemoteProto:  proto,
+			FetchedAt:    time.Now().Unix(),
+			ProbeStatus:  "not_checked",
 		}
 		node.ID = StableID(node)
 		nodes = append(nodes, node)
@@ -136,6 +252,8 @@ func ParseAPI(text string) ([]Node, error) {
 	return nodes, nil
 }
 
+type ProbeFunc func(context.Context, Node) (bool, string)
+
 func SelectCandidates(nodes []Node, maxRows int) []Node {
 	if maxRows <= 0 || maxRows > len(nodes) {
 		maxRows = len(nodes)
@@ -151,9 +269,16 @@ func SelectCandidates(nodes []Node, maxRows int) []Node {
 }
 
 func CheckCandidates(ctx context.Context, nodes []Node, targetValid int, timeout time.Duration) []Node {
+	return CheckCandidatesWithProbe(ctx, nodes, targetValid, timeout, nil)
+}
+
+func CheckCandidatesWithProbe(ctx context.Context, nodes []Node, targetValid int, timeout time.Duration, probe ProbeFunc) []Node {
 	if targetValid <= 0 {
 		targetValid = len(nodes)
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	skipTCPPrefilter := probe != nil && upstreamProxyURL() != nil
 	type result struct {
 		node Node
 		ok   bool
@@ -170,14 +295,33 @@ func CheckCandidates(ctx context.Context, nodes []Node, targetValid int, timeout
 		go func() {
 			defer wg.Done()
 			for node := range jobs {
-				ok := dialCheck(ctx, node.RemoteHost, node.RemotePort, timeout)
+				ok := false
+				message := "TCP probe failed"
+				if probe != nil && (skipTCPPrefilter || strings.Contains(strings.ToLower(node.RemoteProto), "udp")) {
+					ok, message = probe(runCtx, node)
+				} else {
+					tcpOK := dialCheck(runCtx, node.RemoteHost, node.RemotePort, timeout)
+					if tcpOK {
+						ok = true
+						message = "TCP probe succeeded"
+					}
+					if probe != nil {
+						if tcpOK || strings.Contains(strings.ToLower(node.RemoteProto), "udp") {
+							ok, message = probe(runCtx, node)
+						} else {
+							ok = false
+							message = "TCP prefilter failed"
+						}
+					}
+				}
 				if ok {
-					node.ProbeStatus = "ok"
-					node.ProbeMessage = "TCP probe succeeded"
+					node.ProbeStatus = "available"
+					node.ProbeMessage = message
 				} else {
 					node.ProbeStatus = "unavailable"
-					node.ProbeMessage = "TCP probe failed"
+					node.ProbeMessage = message
 				}
+				node.ProbedAt = time.Now().Unix()
 				results <- result{node: node, ok: ok}
 			}
 		}()
@@ -186,7 +330,7 @@ func CheckCandidates(ctx context.Context, nodes []Node, targetValid int, timeout
 		defer close(jobs)
 		for _, node := range nodes {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			case jobs <- node:
 			}
@@ -204,16 +348,20 @@ func CheckCandidates(ctx context.Context, nodes []Node, targetValid int, timeout
 			valid++
 		}
 		if valid >= targetValid {
-			// Keep draining goroutines through context cancellation at caller discretion.
+			cancel()
 		}
 	}
 	sort.SliceStable(checked, func(i, j int) bool {
 		if checked[i].ProbeStatus == checked[j].ProbeStatus {
 			return checked[i].Ping < checked[j].Ping
 		}
-		return checked[i].ProbeStatus == "ok"
+		return isAvailable(checked[i].ProbeStatus)
 	})
 	return checked
+}
+
+func isAvailable(status string) bool {
+	return status == "ok" || status == "available"
 }
 
 func ParseRemote(configText, fallbackIP string) (string, int, string) {

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 const (
@@ -79,18 +80,37 @@ func status() error {
 }
 
 func logs(args []string) error {
-	logFile := filepath.Join(dataDir(), "vpngate.log")
-	tailArgs := append([]string{"-n", "120"}, args...)
-	tailArgs = append(tailArgs, logFile)
-	if _, err := exec.LookPath("tail"); err == nil {
-		return run("tail", tailArgs...)
+	if logFile := preferredLogFile(); logFile != "" {
+		tailArgs := append([]string{"-n", "120"}, args...)
+		tailArgs = append(tailArgs, logFile)
+		if _, err := exec.LookPath("tail"); err == nil {
+			return run("tail", tailArgs...)
+		}
+		raw, err := os.ReadFile(logFile)
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(raw))
+		return nil
 	}
-	raw, err := os.ReadFile(logFile)
-	if err != nil {
-		return err
+	if _, err := exec.LookPath("journalctl"); err == nil {
+		journalArgs := append([]string{"-u", serviceName + ".service", "-n", "120", "--no-pager"}, args...)
+		return run("journalctl", journalArgs...)
 	}
-	fmt.Print(string(raw))
-	return nil
+	return fmt.Errorf("no AimiliVPN log file found under %s", dataDir())
+}
+
+func preferredLogFile() string {
+	for _, path := range []string{
+		filepath.Join(dataDir(), "logs", currentDay()+".json"),
+		filepath.Join(dataDir(), "vpngate.log"),
+	} {
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Size() > 0 {
+			return path
+		}
+	}
+	return ""
 }
 
 func setUI(args []string) error {
@@ -171,6 +191,7 @@ type uiConfig struct {
 	SecretPath string `json:"secret_path"`
 	Username   string `json:"username"`
 	Password   string `json:"password"`
+	Raw        map[string]any
 }
 
 func loadUIConfig() (uiConfig, error) {
@@ -183,14 +204,28 @@ func loadUIConfig() (uiConfig, error) {
 		}
 		return cfg, err
 	}
-	return cfg, json.Unmarshal(raw, &cfg)
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return cfg, err
+	}
+	_ = json.Unmarshal(raw, &cfg.Raw)
+	return cfg, nil
 }
 
 func saveUIConfig(cfg uiConfig) error {
 	if err := os.MkdirAll(dataDir(), 0o755); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(cfg, "", "  ")
+	data := cfg.Raw
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["host"] = cfg.Host
+	data["port"] = cfg.Port
+	data["proxy_port"] = cfg.ProxyPort
+	data["secret_path"] = cfg.SecretPath
+	data["username"] = cfg.Username
+	data["password"] = cfg.Password
+	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -226,4 +261,11 @@ func stringTrim(raw []byte) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+func currentDay() string {
+	if value := os.Getenv("AIMILIVPN_LOG_DAY"); value != "" {
+		return value
+	}
+	return time.Now().Format("2006-01-02")
 }

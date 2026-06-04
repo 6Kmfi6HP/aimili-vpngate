@@ -9,5 +9,15 @@
   "last_check_message": "fixture state",
   "is_connecting": false,
   "active_node_latency": "not connected",
-  "blacklisted_nodes": 0
+  "blacklisted_nodes": 0,
+  "username": "admin",
+  "port": 8787,
+  "secret_path": "FixtureSecret12",
+  "proxy_port": 7928,
+  "routing_mode": "auto",
+  "force_country": "",
+  "proxy_ok": false,
+  "proxy_ip": "-",
+  "proxy_latency_ms": 0,
+  "proxy_error": ""
 }

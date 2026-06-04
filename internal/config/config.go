@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const DefaultAPIURL = "https://www.vpngate.net/api/iphone/"
@@ -28,6 +29,7 @@ type Config struct {
 	DataDir                   string
 	ContainerMode             bool
 	AutoConnect               bool
+	ProxyCheckURLs            []string
 }
 
 func Load(version string) Config {
@@ -50,6 +52,7 @@ func Load(version string) Config {
 		InvalidBackoffSeconds:     getenvInt("INVALID_BACKOFF_SECONDS", 30*60),
 		ContainerMode:             getenvBool("AIMILIVPN_CONTAINER", false),
 		AutoConnect:               getenvBool("AIMILIVPN_AUTOCONNECT", true),
+		ProxyCheckURLs:            getenvCSV("AIMILIVPN_PROXY_CHECK_URLS", []string{"http://ip.sb", "http://api.ipify.org"}),
 	}
 	cfg.DataDir = dataDir(cfg.ContainerMode)
 	return cfg
@@ -96,6 +99,24 @@ func getenvBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+func getenvCSV(name string, fallback []string) []string {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }
 
 func dataDir(container bool) string {

@@ -13,9 +13,10 @@ import (
 )
 
 type fakeBackend struct {
-	cfg   state.UIConfig
-	nodes []vpngate.Node
-	logs  []state.LogEntry
+	cfg       state.UIConfig
+	nodes     []vpngate.Node
+	logs      []state.LogEntry
+	testedIDs []string
 }
 
 func (f *fakeBackend) UIConfig() state.UIConfig { return f.cfg }
@@ -35,6 +36,10 @@ func (f *fakeBackend) Connect(context.Context, string) (string, error) {
 func (f *fakeBackend) Disconnect() error { return nil }
 func (f *fakeBackend) TestNode(context.Context, string) (vpngate.Node, error) {
 	return f.nodes[0], nil
+}
+func (f *fakeBackend) TestNodes(_ context.Context, ids []string) ([]vpngate.Node, error) {
+	f.testedIDs = append([]string{}, ids...)
+	return f.nodes, nil
 }
 func (f *fakeBackend) TestProxy(context.Context) (map[string]any, error) {
 	return map[string]any{"ok": true}, nil
@@ -110,7 +115,7 @@ func TestUnauthorizedThenLogin(t *testing.T) {
 func TestUpdateSettingsAndLogs(t *testing.T) {
 	backend := &fakeBackend{
 		cfg:  state.UIConfig{SecretPath: "secret", Username: "admin"},
-		logs: []state.LogEntry{{Level: "INFO", Module: "Test", Message: "ok"}},
+		logs: []state.LogEntry{{Timestamp: "2026-01-02 03:04:05", Level: "INFO", Module: "Test", Message: "ok"}},
 	}
 	server := httptest.NewServer(New(backend))
 	defer server.Close()
@@ -119,12 +124,20 @@ func TestUpdateSettingsAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
 		t.Fatalf("update status = %d", resp.StatusCode)
 	}
+	var updateBody map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&updateBody); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
 	if backend.cfg.Port != 9999 || backend.cfg.ProxyPort != 18888 || backend.cfg.ForceCountry != "JP" {
 		t.Fatalf("settings not updated: %#v", backend.cfg)
+	}
+	if updateBody["restart_needed"] != true {
+		t.Fatalf("listener change should require restart: %#v", updateBody)
 	}
 	resp, err = http.Get(server.URL + "/secret/api/logs")
 	if err != nil {
@@ -133,5 +146,98 @@ func TestUpdateSettingsAndLogs(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("logs status = %d", resp.StatusCode)
+	}
+}
+
+func TestUpdateSettingsRejectsInvalidValues(t *testing.T) {
+	backend := &fakeBackend{cfg: state.UIConfig{SecretPath: "secret", Username: "admin", Port: 8787, ProxyPort: 7928, RoutingMode: "auto"}}
+	server := httptest.NewServer(New(backend))
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/secret/api/update_settings", "application/json", strings.NewReader(`{"port":80,"proxy_port":80,"secret_path":"bad/path","routing_mode":"else"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	resp, err = http.Post(server.URL+"/secret/api/update_settings", "application/json", strings.NewReader(`{"secret_path":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty secret status = %d", resp.StatusCode)
+	}
+}
+
+func TestUpdateRoutingDoesNotRequireRestart(t *testing.T) {
+	backend := &fakeBackend{cfg: state.UIConfig{SecretPath: "secret", Username: "admin", Port: 8787, ProxyPort: 7928, RoutingMode: "auto"}}
+	server := httptest.NewServer(New(backend))
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/secret/api/update_settings", "application/json", strings.NewReader(`{"routing_mode":"fixed_region","force_country":"JP"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || body["restart_needed"] != false {
+		t.Fatalf("unexpected response %d %#v", resp.StatusCode, body)
+	}
+	if backend.cfg.RoutingMode != "fixed_region" || backend.cfg.ForceCountry != "JP" {
+		t.Fatalf("routing not saved: %#v", backend.cfg)
+	}
+
+	resp, err = http.Post(server.URL+"/secret/api/update_routing", "application/json", strings.NewReader(`{"routing_mode":"auto","force_country":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body = map[string]any{}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || body["restart_needed"] != false {
+		t.Fatalf("unexpected update_routing response %d %#v", resp.StatusCode, body)
+	}
+}
+
+func TestTestNodesCallsBackend(t *testing.T) {
+	backend := &fakeBackend{
+		cfg:   state.UIConfig{SecretPath: "secret", Username: "admin"},
+		nodes: []vpngate.Node{{ID: "node-1"}, {ID: "node-2"}},
+	}
+	server := httptest.NewServer(New(backend))
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/secret/api/test_nodes", "application/json", strings.NewReader(`{"ids":["node-1","node-2"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if strings.Join(backend.testedIDs, ",") != "node-1,node-2" {
+		t.Fatalf("tested ids = %#v", backend.testedIDs)
+	}
+}
+
+func TestIndexHTMLRendersStructuredGatewayAndLogs(t *testing.T) {
+	for _, want := range []string{"Gateway Status", "id=\"services\"", "id=\"logRows\"", "services.innerHTML", "logRows.innerHTML", "runAction"} {
+		if !strings.Contains(indexHTML, want) {
+			t.Fatalf("indexHTML missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"show(await api('gateway_status'))", "show(await api('logs'))"} {
+		if strings.Contains(indexHTML, unwanted) {
+			t.Fatalf("indexHTML still renders raw JSON path %q", unwanted)
+		}
 	}
 }

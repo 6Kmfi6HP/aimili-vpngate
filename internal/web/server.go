@@ -3,8 +3,10 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ type Backend interface {
 	Connect(context.Context, string) (string, error)
 	Disconnect() error
 	TestNode(context.Context, string) (vpngate.Node, error)
+	TestNodes(context.Context, []string) ([]vpngate.Node, error)
 	TestProxy(context.Context) (map[string]any, error)
 	GatewayStatus() ([]map[string]any, error)
 	Logs() ([]state.LogEntry, error)
@@ -143,21 +146,33 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case "/api/update_settings":
-		cfg := s.Backend.UIConfig()
-		updateSettings(payload, &cfg)
+		old := s.Backend.UIConfig()
+		cfg := old
+		if err := updateSettings(payload, &cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		if err := s.Backend.UpdateUIConfig(cfg); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_needed": false, "message": "settings updated"})
+		restartNeeded := old.Port != cfg.Port || old.ProxyPort != cfg.ProxyPort || old.SecretPath != cfg.SecretPath
+		message := "settings updated"
+		if restartNeeded {
+			message = "settings updated; restart required for listener changes"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_needed": restartNeeded, "message": message})
 	case "/api/update_routing":
 		cfg := s.Backend.UIConfig()
-		updateRouting(payload, &cfg)
+		if err := updateRouting(payload, &cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		if err := s.Backend.UpdateUIConfig(cfg); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "routing updated"})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_needed": false, "message": "routing updated"})
 	case "/api/check":
 		msg, err := s.Backend.RefreshNodes(r.Context(), true)
 		writeResult(w, msg, err)
@@ -167,7 +182,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, path string)
 		}()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "node refresh started"})
 	case "/api/test_nodes":
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": []vpngate.Node{}})
+		ids := stringSlice(payload["ids"])
+		nodes, err := s.Backend.TestNodes(r.Context(), ids)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": nodes})
 	case "/api/disconnect":
 		writeResult(w, "disconnected", s.Backend.Disconnect())
 	case "/api/connect":
@@ -272,31 +293,54 @@ func writeResult(w http.ResponseWriter, message string, err error) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": message})
 }
 
-func updateSettings(payload map[string]any, cfg *state.UIConfig) {
-	if value, ok := payload["secret_path"].(string); ok && value != "" {
+func updateSettings(payload map[string]any, cfg *state.UIConfig) error {
+	if value, ok := payload["secret_path"].(string); ok {
+		if !regexp.MustCompile(`^[A-Za-z0-9]+$`).MatchString(value) {
+			return fmt.Errorf("secret path must contain only letters and numbers")
+		}
 		cfg.SecretPath = value
 	}
 	if value, ok := payload["routing_mode"].(string); ok && value != "" {
+		if !validRoutingMode(value) {
+			return fmt.Errorf("invalid routing mode")
+		}
 		cfg.RoutingMode = value
 	}
 	if value, ok := payload["force_country"].(string); ok {
 		cfg.ForceCountry = value
 	}
 	if value, ok := numberValue(payload["port"]); ok {
+		if value < 1 || value > 65535 {
+			return fmt.Errorf("port must be between 1 and 65535")
+		}
 		cfg.Port = value
 	}
 	if value, ok := numberValue(payload["proxy_port"]); ok {
+		if value < 1024 || value > 65535 {
+			return fmt.Errorf("proxy port must be between 1024 and 65535")
+		}
 		cfg.ProxyPort = value
 	}
+	if cfg.Port == cfg.ProxyPort {
+		return fmt.Errorf("management UI port and proxy port must differ")
+	}
+	if cfg.RoutingMode == "" {
+		cfg.RoutingMode = "auto"
+	}
+	return nil
 }
 
-func updateRouting(payload map[string]any, cfg *state.UIConfig) {
+func updateRouting(payload map[string]any, cfg *state.UIConfig) error {
 	if value, ok := payload["routing_mode"].(string); ok && value != "" {
+		if !validRoutingMode(value) {
+			return fmt.Errorf("invalid routing mode")
+		}
 		cfg.RoutingMode = value
 	}
 	if value, ok := payload["force_country"].(string); ok {
 		cfg.ForceCountry = value
 	}
+	return nil
 }
 
 func stringValue(value any) string {
@@ -317,6 +361,27 @@ func numberValue(value any) (int, bool) {
 	}
 }
 
+func stringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		if s, ok := value.(string); ok && s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func validRoutingMode(value string) bool {
+	return value == "auto" || value == "fixed_ip" || value == "fixed_region"
+}
+
 const loginHTML = `<!doctype html>
 <html><head><meta charset="utf-8"><title>AimiliVPN Login</title><style>body{font-family:sans-serif;margin:3rem;max-width:32rem}input,button{font:inherit;padding:.7rem;margin:.3rem 0;width:100%}</style></head>
 <body><h1>AimiliVPN</h1><form id="f"><input name="username" placeholder="admin" autocomplete="username"><input name="password" type="password" placeholder="password" autocomplete="current-password"><button>Login</button></form><p id="m"></p><script>
@@ -324,11 +389,34 @@ f.onsubmit=async e=>{e.preventDefault();const d=Object.fromEntries(new FormData(
 </script></body></html>`
 
 const indexHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>AimiliVPN</title><style>body{font-family:sans-serif;margin:2rem;background:#111;color:#eee}button{padding:.55rem .8rem;margin:.25rem}pre{background:#1b1b1b;padding:1rem;overflow:auto}</style></head>
-<body><h1>AimiliVPN</h1><p>Go runtime management UI</p><button onclick="refresh()">Refresh nodes</button><button onclick="status()">Gateway status</button><button onclick="logs()">Logs</button><pre id="out">Loading...</pre><script>
-async function load(){out.textContent=JSON.stringify(await (await fetch('./api/nodes')).json(),null,2)}
-async function refresh(){out.textContent=JSON.stringify(await (await fetch('./api/refresh_nodes',{method:'POST'})).json(),null,2)}
-async function status(){out.textContent=JSON.stringify(await (await fetch('./api/gateway_status')).json(),null,2)}
-async function logs(){out.textContent=JSON.stringify(await (await fetch('./api/logs')).json(),null,2)}
-load();
+<html><head><meta charset="utf-8"><title>AimiliVPN</title><style>
+body{font-family:system-ui,sans-serif;margin:0;background:#101418;color:#eef2f3}header,section{padding:18px 24px}button,input,select{font:inherit;padding:.48rem;margin:.16rem}button{cursor:pointer}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid #303940;padding:.5rem;text-align:left;vertical-align:top}section{border-top:1px solid #303940}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.muted{color:#aab4bb}.ok{color:#65d480}.bad{color:#ff8080}.warn{color:#ffd36a}pre{white-space:pre-wrap;background:#182027;padding:12px;max-height:160px;overflow:auto}.feedback{min-height:1.5rem}
+</style></head><body>
+<header><h1>AimiliVPN</h1><div id="summary" class="muted">Loading...</div></header>
+<section><div class="row"><button onclick="refreshNodes()">Refresh</button><button onclick="testSelected()">Test selected</button><button onclick="testProxy()">Test proxy</button><button onclick="loadStatus()">Gateway</button><button onclick="loadLogs()">Logs</button></div><div id="feedback" class="feedback muted"></div></section>
+<section><h2>Nodes</h2><table><thead><tr><th></th><th>ID</th><th>Country</th><th>Remote</th><th>Latency</th><th>Status</th><th>Actions</th></tr></thead><tbody id="nodes"></tbody></table></section>
+<section><h2>Settings</h2><div class="row"><input id="uiPort" type="number" placeholder="UI port"><input id="proxyPort" type="number" placeholder="Proxy port"><input id="secretPath" placeholder="Secret path"><select id="routeMode"><option value="auto">auto</option><option value="fixed_region">fixed_region</option><option value="fixed_ip">fixed_ip</option></select><input id="forceCountry" placeholder="Country"><button onclick="saveSettings()">Save settings</button><button onclick="saveRouting()">Save routing</button></div><div class="row"><input id="username" placeholder="Username"><input id="password" type="password" placeholder="Password"><button onclick="saveCredentials()">Update credentials</button></div></section>
+<section><h2>Gateway Status</h2><table><thead><tr><th>Service</th><th>Status</th><th>Details</th><th>Error</th></tr></thead><tbody id="services"></tbody></table></section>
+<section><h2>Logs</h2><table><thead><tr><th>Time</th><th>Level</th><th>Module</th><th>Message</th></tr></thead><tbody id="logRows"></tbody></table></section>
+<section><h2>Output</h2><pre id="out">Ready.</pre></section>
+<script>
+let current={nodes:[],state:{}};
+async function api(path,opts={}){const r=await fetch('./api/'+path,{headers:{'Content-Type':'application/json'},...opts});let j={};try{j=await r.json()}catch{}if(!r.ok||j.ok===false) throw new Error(j.error||j.message||r.statusText);return j}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function load(){current=await api('nodes');render();await loadStatus(false);await loadLogs(false)}
+function render(){const s=current.state||{};summary.textContent='Active: '+(s.active_openvpn_node_id||'none')+' | Proxy: '+(s.proxy_ok?'ok':'not ready')+' | '+(s.last_check_message||'');uiPort.value=s.port||'';proxyPort.value=s.proxy_port||'';secretPath.value=s.secret_path||'';routeMode.value=s.routing_mode||'auto';forceCountry.value=s.force_country||'';username.value=s.username||'';nodes.innerHTML=(current.nodes||[]).map(n=>'<tr><td><input type="checkbox" value="'+esc(n.id)+'"></td><td>'+esc(n.id)+(n.active?' <span class="ok">active</span>':'')+'</td><td>'+esc(n.country||n.country_short)+'</td><td>'+esc(n.remote_host)+':'+esc(n.remote_port)+' '+esc(n.proto||n.remote_proto)+'</td><td>'+esc(n.latency_ms||n.ping||'')+'</td><td class="'+(n.probe_status==='available'||n.probe_status==='ok'?'ok':'bad')+'">'+esc(n.probe_status||'not_checked')+'</td><td><button onclick="connectNode(\''+esc(n.id)+'\')">Connect</button><button onclick="testNode(\''+esc(n.id)+'\')">Test</button><button onclick="disconnectNode()">Disconnect</button></td></tr>').join('')}
+function show(message,bad=false){feedback.textContent=message||'';feedback.className='feedback '+(bad?'bad':'ok');out.textContent=message||'Ready.'}
+async function runAction(label,fn,reload=true){try{const r=await fn();const msg=r.message||(r.restart_needed?'Restart required for listener changes':label+' complete');show(msg+(r.nodes?' ('+r.nodes.length+' nodes)':''));if(reload) await load();return r}catch(e){show(e.message||String(e),true)}}
+async function refreshNodes(){await runAction('Refresh',()=>api('refresh_nodes',{method:'POST'}));setTimeout(load,600)}
+async function testSelected(){const ids=[...document.querySelectorAll('tbody input:checked')].map(x=>x.value);await runAction('Batch test',()=>api('test_nodes',{method:'POST',body:JSON.stringify({ids})}))}
+async function testNode(id){await runAction('Node test',()=>api('test_node',{method:'POST',body:JSON.stringify({id})}))}
+async function connectNode(id){await runAction('Connect',()=>api('connect',{method:'POST',body:JSON.stringify({id})}))}
+async function disconnectNode(){await runAction('Disconnect',()=>api('disconnect',{method:'POST'}))}
+async function testProxy(){await runAction('Proxy test',()=>api('test_proxy',{method:'POST'}))}
+async function loadStatus(notify=true){try{const r=await api('gateway_status');services.innerHTML=(r.services||[]).map(s=>'<tr><td>'+esc(s.name)+'</td><td class="'+(s.status==='running'?'ok':s.status==='starting'?'warn':'bad')+'">'+esc(s.status)+'</td><td>'+esc(s.details||'')+'</td><td class="bad">'+esc(s.error||'')+'</td></tr>').join('');if(notify) show('Gateway status refreshed')}catch(e){if(notify) show(e.message,true)}}
+async function loadLogs(notify=true){try{const r=await api('logs');logRows.innerHTML=(r.logs||[]).slice(-120).reverse().map(l=>'<tr><td>'+esc(l.timestamp||l.time)+'</td><td>'+esc(l.level)+'</td><td>'+esc(l.module)+'</td><td>'+esc(l.message)+'</td></tr>').join('');if(!logRows.innerHTML) logRows.innerHTML='<tr><td colspan="4" class="muted">No logs yet.</td></tr>';if(notify) show('Logs refreshed')}catch(e){if(notify) show(e.message,true)}}
+async function saveSettings(){await runAction('Settings',()=>api('update_settings',{method:'POST',body:JSON.stringify({port:Number(uiPort.value),proxy_port:Number(proxyPort.value),secret_path:secretPath.value,routing_mode:routeMode.value,force_country:forceCountry.value})}))}
+async function saveRouting(){await runAction('Routing',()=>api('update_routing',{method:'POST',body:JSON.stringify({routing_mode:routeMode.value,force_country:forceCountry.value})}))}
+async function saveCredentials(){await runAction('Credentials',()=>api('update_credentials',{method:'POST',body:JSON.stringify({username:username.value,password:password.value})}),false)}
+load().catch(e=>show(e.message));
 </script></body></html>`

@@ -31,10 +31,11 @@ type UIConfig struct {
 }
 
 type LogEntry struct {
-	Time    string `json:"time"`
-	Level   string `json:"level"`
-	Module  string `json:"module"`
-	Message string `json:"message"`
+	Timestamp string `json:"timestamp"`
+	Time      string `json:"time,omitempty"`
+	Level     string `json:"level"`
+	Module    string `json:"module"`
+	Message   string `json:"message"`
 }
 
 func NewStore(dir string) *Store {
@@ -144,7 +145,30 @@ func (s *Store) LoadUIConfig(defaultHost string, defaultPort, defaultProxyPort i
 func (s *Store) SaveUIConfig(cfg UIConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return WriteJSON(s.UIConfigFile(), cfg, 0o600)
+	data := map[string]any{}
+	raw, err := os.ReadFile(s.UIConfigFile())
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return err
+		}
+	}
+	data["host"] = cfg.Host
+	data["port"] = cfg.Port
+	data["proxy_port"] = cfg.ProxyPort
+	data["secret_path"] = cfg.SecretPath
+	data["username"] = cfg.Username
+	data["password"] = cfg.Password
+	data["routing_mode"] = cfg.RoutingMode
+	data["force_country"] = cfg.ForceCountry
+	if cfg.FixedNodeID != "" {
+		data["fixed_node_id"] = cfg.FixedNodeID
+	} else {
+		delete(data, "fixed_node_id")
+	}
+	return WriteJSON(s.UIConfigFile(), data, 0o600)
 }
 
 func (s *Store) ReadState() (map[string]any, error) {
@@ -176,10 +200,11 @@ func (s *Store) AppendLog(level, module, message string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := LogEntry{
-		Time:    time.Now().Format(time.RFC3339),
-		Level:   level,
-		Module:  module,
-		Message: message,
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+		Time:      time.Now().Format(time.RFC3339),
+		Level:     level,
+		Module:    module,
+		Message:   message,
 	}
 	raw, err := json.Marshal(entry)
 	if err != nil {
@@ -213,6 +238,12 @@ func (s *Store) ReadLogs() ([]LogEntry, error) {
 	for scanner.Scan() {
 		var entry LogEntry
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err == nil {
+			if entry.Timestamp == "" {
+				entry.Timestamp = entry.Time
+			}
+			if entry.Time == "" {
+				entry.Time = entry.Timestamp
+			}
 			entries = append(entries, entry)
 		}
 	}

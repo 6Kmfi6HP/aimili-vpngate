@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,14 +23,21 @@ import (
 )
 
 type App struct {
-	cfg    config.Config
-	store  *state.Store
-	ui     state.UIConfig
-	ovpn   *openvpn.Manager
-	nodes  []vpngate.Node
-	mu     sync.Mutex
-	opMu   sync.Mutex
-	logger *log.Logger
+	cfg     config.Config
+	store   *state.Store
+	ui      state.UIConfig
+	ovpn    *openvpn.Manager
+	nodes   []vpngate.Node
+	mu      sync.Mutex
+	opMu    sync.Mutex
+	probeMu sync.Mutex
+	logger  *log.Logger
+
+	lastCollectorHeartbeat time.Time
+	lastProxyHeartbeat     time.Time
+	lastPingerHeartbeat    time.Time
+	lastRouteError         string
+	proxyFailureCount      int
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -58,6 +66,8 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.ovpn.EnsureAuthFile(); err != nil {
 		return err
 	}
+	defer a.cleanupPolicyRouting()
+	defer a.ovpn.Stop()
 	a.updateInitialState()
 	for _, check := range diagnostics.RuntimeChecks(a.cfg) {
 		if !check.OK {
@@ -78,6 +88,8 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 	go a.maintainLoop(ctx)
+	go a.proxyHealthLoop(ctx)
+	go a.activeLatencyLoop(ctx)
 
 	webAddr := net.JoinHostPort(a.ui.Host, strconv.Itoa(a.ui.Port))
 	a.logger.Printf("UI: http://%s/", webAddr)
@@ -98,7 +110,10 @@ func (a *App) UpdateUIConfig(cfg state.UIConfig) error {
 	a.mu.Lock()
 	a.ui = cfg
 	a.mu.Unlock()
-	return a.store.SaveUIConfig(cfg)
+	if err := a.store.SaveUIConfig(cfg); err != nil {
+		return err
+	}
+	return a.store.UpdateState(a.uiStateFields(cfg))
 }
 
 func (a *App) Nodes() ([]vpngate.Node, map[string]any, error) {
@@ -109,11 +124,33 @@ func (a *App) Nodes() ([]vpngate.Node, map[string]any, error) {
 	activeID := a.ovpn.NodeID()
 	for i := range nodes {
 		nodes[i].Active = activeID != "" && nodes[i].ID == activeID
+		if nodes[i].HostName == "" {
+			nodes[i].HostName = nodes[i].Hostname
+		}
+		if nodes[i].Hostname == "" {
+			nodes[i].Hostname = nodes[i].HostName
+		}
+		if nodes[i].CountryShort == "" {
+			nodes[i].CountryShort = nodes[i].Country
+		}
+		if nodes[i].Proto == "" {
+			nodes[i].Proto = nodes[i].RemoteProto
+		}
+		if nodes[i].LatencyMS == 0 {
+			nodes[i].LatencyMS = nodes[i].Ping
+		}
 		nodes[i].ConfigText = ""
 	}
 	runtimeState, err := a.store.ReadState()
 	if err != nil {
 		return nil, nil, err
+	}
+	for key, value := range a.uiStateFields(a.ui) {
+		runtimeState[key] = value
+	}
+	runtimeState["active_openvpn_node_id"] = activeID
+	if _, ok := runtimeState["is_connecting"]; !ok {
+		runtimeState["is_connecting"] = false
 	}
 	return nodes, runtimeState, nil
 }
@@ -127,13 +164,13 @@ func (a *App) RefreshNodes(ctx context.Context, force bool) (string, error) {
 		return "", err
 	}
 	candidates := vpngate.SelectCandidates(nodes, a.cfg.MaxScanRows)
-	checked := vpngate.CheckCandidates(ctx, candidates, a.cfg.TargetValidNodes, 3*time.Second)
-	for i := range checked {
-		path, err := openvpn.WriteConfig(a.store.ConfigDir(), checked[i])
+	for i := range candidates {
+		path, err := openvpn.WriteConfig(a.store.ConfigDir(), candidates[i])
 		if err == nil {
-			checked[i].ConfigFile = path
+			candidates[i].ConfigFile = path
 		}
 	}
+	checked := a.checkNodes(ctx, candidates, a.cfg.TargetValidNodes)
 	a.mu.Lock()
 	a.nodes = checked
 	a.mu.Unlock()
@@ -181,53 +218,111 @@ func (a *App) Connect(ctx context.Context, id string) (string, error) {
 		_ = a.store.UpdateState(map[string]any{"is_connecting": false, "last_check_message": err.Error()})
 		return "", err
 	}
+	if err := a.setupPolicyRouting("tun0"); err != nil {
+		a.lastRouteError = err.Error()
+		_ = a.store.AppendLog("WARNING", "Routing", err.Error())
+	} else {
+		a.lastRouteError = ""
+	}
+	proxyResult, _ := a.TestProxy(ctx)
 	msg := "connected " + selected.ID
-	_ = a.store.UpdateState(map[string]any{"is_connecting": false, "active_openvpn_node_id": selected.ID, "last_check_message": msg})
+	_ = a.store.UpdateState(map[string]any{
+		"is_connecting":          false,
+		"active_openvpn_node_id": selected.ID,
+		"last_check_message":     msg,
+		"proxy_ok":               proxyResult["ok"],
+		"proxy_ip":               proxyResult["ip"],
+		"proxy_latency_ms":       proxyResult["latency_ms"],
+		"proxy_error":            proxyResult["error"],
+	})
 	return msg, nil
 }
 
 func (a *App) Disconnect() error {
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
+	a.cleanupPolicyRouting()
 	a.ovpn.Stop()
 	return a.store.UpdateState(map[string]any{"active_openvpn_node_id": "", "active_node_latency": "not connected", "last_check_message": "manual disconnect"})
 }
 
 func (a *App) TestNode(ctx context.Context, id string) (vpngate.Node, error) {
+	nodes, err := a.TestNodes(ctx, []string{id})
+	if err != nil {
+		return vpngate.Node{}, err
+	}
+	if len(nodes) == 0 {
+		return vpngate.Node{}, fmt.Errorf("node %q not found", id)
+	}
+	return nodes[0], nil
+}
+
+func (a *App) TestNodes(ctx context.Context, ids []string) ([]vpngate.Node, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	byID := map[string]bool{}
+	for _, id := range ids {
+		byID[id] = true
+	}
+	var selected []vpngate.Node
 	for _, node := range a.nodes {
-		if node.ID == id {
-			checked := vpngate.CheckCandidates(ctx, []vpngate.Node{node}, 1, 3*time.Second)
-			if len(checked) == 0 {
-				return node, nil
-			}
-			return checked[0], nil
+		if byID[node.ID] {
+			selected = append(selected, node)
 		}
 	}
-	return vpngate.Node{}, fmt.Errorf("node %q not found", id)
+	a.mu.Unlock()
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("no matching nodes")
+	}
+	for i := range selected {
+		if selected[i].ConfigFile == "" {
+			path, err := openvpn.WriteConfig(a.store.ConfigDir(), selected[i])
+			if err == nil {
+				selected[i].ConfigFile = path
+			}
+		}
+	}
+	checked := a.checkNodes(ctx, selected, len(selected))
+	a.mu.Lock()
+	for i := range a.nodes {
+		for _, updated := range checked {
+			if a.nodes[i].ID == updated.ID {
+				a.nodes[i] = mergeNode(a.nodes[i], updated)
+			}
+		}
+	}
+	saved := make([]vpngate.Node, len(a.nodes))
+	copy(saved, a.nodes)
+	a.mu.Unlock()
+	_ = state.WriteJSON(a.store.NodesFile(), saved, 0o644)
+	return checked, nil
 }
 
 func (a *App) TestProxy(ctx context.Context) (map[string]any, error) {
-	host := a.cfg.LocalProxyHost
-	if host == "" || host == "::" || host == "0.0.0.0" {
-		host = "127.0.0.1"
-	}
-	address := net.JoinHostPort(host, strconv.Itoa(a.ui.ProxyPort))
-	d := net.Dialer{Timeout: 2 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return map[string]any{"ok": false, "error": err.Error()}, nil
-	}
-	_ = conn.Close()
-	return map[string]any{"ok": true, "message": "proxy listener is reachable"}, nil
+	result := a.checkProxyHealth(ctx)
+	_ = a.store.UpdateState(map[string]any{
+		"proxy_ok":         result["ok"],
+		"proxy_ip":         result["ip"],
+		"proxy_latency_ms": result["latency_ms"],
+		"proxy_error":      result["error"],
+	})
+	return result, nil
 }
 
 func (a *App) GatewayStatus() ([]map[string]any, error) {
+	proxyResult := a.checkProxyListener(context.Background())
+	proxyStatus := "running"
+	proxyErr := ""
+	if err, _ := proxyResult["error"].(string); err != "" {
+		proxyStatus = "stopped"
+		proxyErr = err
+	}
 	return []map[string]any{
 		{"name": "Web management service", "status": "running", "details": fmt.Sprintf("%s:%d", a.ui.Host, a.ui.Port), "error": ""},
-		{"name": "Local proxy gateway", "status": "running", "details": fmt.Sprintf("%s:%d", a.cfg.LocalProxyHost, a.ui.ProxyPort), "error": ""},
+		{"name": "Local proxy gateway", "status": proxyStatus, "details": fmt.Sprintf("%s:%d", a.cfg.LocalProxyHost, a.ui.ProxyPort), "error": proxyErr},
 		{"name": "OpenVPN core", "status": status(a.ovpn.Running()), "details": a.ovpn.NodeID(), "error": ""},
+		{"name": "Node refresh worker", "status": heartbeatStatus(a.lastCollectorHeartbeat, time.Duration(a.cfg.FetchIntervalSeconds)*2*time.Second), "details": heartbeatDetails(a.lastCollectorHeartbeat), "error": ""},
+		{"name": "Proxy health worker", "status": heartbeatStatus(a.lastProxyHeartbeat, 90*time.Second), "details": heartbeatDetails(a.lastProxyHeartbeat), "error": a.lastRouteError},
+		{"name": "Active latency worker", "status": heartbeatStatus(a.lastPingerHeartbeat, 30*time.Second), "details": heartbeatDetails(a.lastPingerHeartbeat), "error": ""},
 	}, nil
 }
 
@@ -266,10 +361,16 @@ func (a *App) updateInitialState() {
 		"openvpn_timeout_seconds":  a.cfg.OpenVPNTestTimeoutSeconds,
 		"container_mode":           a.cfg.ContainerMode,
 		"management_secret_suffix": a.ui.SecretPath,
+		"proxy_ok":                 false,
+		"proxy_ip":                 "-",
+		"proxy_latency_ms":         0,
+		"proxy_error":              "",
 	})
+	_ = a.store.UpdateState(a.uiStateFields(a.ui))
 }
 
 func (a *App) maintainLoop(ctx context.Context) {
+	a.lastCollectorHeartbeat = time.Now()
 	a.maintainOnce(ctx)
 	ticker := time.NewTicker(time.Duration(a.cfg.FetchIntervalSeconds) * time.Second)
 	defer ticker.Stop()
@@ -278,6 +379,7 @@ func (a *App) maintainLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			a.lastCollectorHeartbeat = time.Now()
 			a.maintainOnce(ctx)
 		}
 	}
@@ -308,7 +410,7 @@ func (a *App) selectRouteCandidate() (vpngate.Node, bool) {
 		if node.InvalidUntil > time.Now().Unix() {
 			continue
 		}
-		if node.ProbeStatus != "ok" && fallback != nil {
+		if !isAvailableStatus(node.ProbeStatus) && fallback != nil {
 			continue
 		}
 		switch cfg.RoutingMode {
@@ -321,7 +423,7 @@ func (a *App) selectRouteCandidate() (vpngate.Node, bool) {
 				return node, true
 			}
 		default:
-			if node.ProbeStatus == "ok" {
+			if isAvailableStatus(node.ProbeStatus) {
 				return node, true
 			}
 		}
@@ -334,6 +436,68 @@ func (a *App) selectRouteCandidate() (vpngate.Node, bool) {
 		return *fallback, true
 	}
 	return vpngate.Node{}, false
+}
+
+func (a *App) checkNodes(ctx context.Context, nodes []vpngate.Node, targetValid int) []vpngate.Node {
+	a.probeMu.Lock()
+	defer a.probeMu.Unlock()
+
+	var mu sync.Mutex
+	nextTun := 2
+	sem := make(chan struct{}, 3)
+	probe := func(ctx context.Context, node vpngate.Node) (bool, string) {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return false, ctx.Err().Error()
+		}
+		defer func() { <-sem }()
+		mu.Lock()
+		device := "tun" + strconv.Itoa(nextTun)
+		nextTun++
+		mu.Unlock()
+		path := node.ConfigFile
+		if path == "" {
+			var err error
+			path, err = openvpn.WriteConfig(a.store.ConfigDir(), node)
+			if err != nil {
+				return false, err.Error()
+			}
+			node.ConfigFile = path
+		}
+		probeTimeout := time.Duration(a.cfg.OpenVPNTestTimeoutSeconds) * time.Second
+		if probeTimeout <= 0 {
+			probeTimeout = 35 * time.Second
+		}
+		res := a.ovpn.Probe(ctx, node, path, device, probeTimeout)
+		return res.OK, res.Message
+	}
+	return vpngate.CheckCandidatesWithProbe(ctx, nodes, targetValid, 3*time.Second, probe)
+}
+
+func (a *App) uiStateFields(cfg state.UIConfig) map[string]any {
+	return map[string]any{
+		"username":      cfg.Username,
+		"port":          cfg.Port,
+		"secret_path":   cfg.SecretPath,
+		"proxy_port":    cfg.ProxyPort,
+		"routing_mode":  cfg.RoutingMode,
+		"force_country": cfg.ForceCountry,
+	}
+}
+
+func mergeNode(oldNode, updated vpngate.Node) vpngate.Node {
+	if updated.ConfigText == "" {
+		updated.ConfigText = oldNode.ConfigText
+	}
+	if updated.ConfigFile == "" {
+		updated.ConfigFile = oldNode.ConfigFile
+	}
+	return updated
+}
+
+func isAvailableStatus(status string) bool {
+	return status == "ok" || status == "available"
 }
 
 func (a *App) markNodeFailure(id string, err error) {
@@ -358,6 +522,23 @@ func status(ok bool) string {
 	return "stopped"
 }
 
+func heartbeatStatus(t time.Time, maxAge time.Duration) string {
+	if t.IsZero() {
+		return "starting"
+	}
+	if time.Since(t) <= maxAge {
+		return "running"
+	}
+	return "stopped"
+}
+
+func heartbeatDetails(t time.Time) string {
+	if t.IsZero() {
+		return "waiting for first heartbeat"
+	}
+	return "last heartbeat: " + t.Format(time.RFC3339)
+}
+
 func stringsContains(s, substr string) bool {
 	return len(substr) == 0 || (len(s) >= len(substr) && (s == substr || len(s) > 0 && contains(s, substr)))
 }
@@ -369,4 +550,8 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func readAllLimit(r io.Reader, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, limit))
 }

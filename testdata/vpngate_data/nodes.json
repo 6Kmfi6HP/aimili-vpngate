@@ -2,16 +2,30 @@
   {
     "id": "jp-198-51-100-10",
     "country": "JP",
+    "country_short": "JP",
     "country_long": "Japan",
+    "host_name": "sample-vpn",
     "ip": "198.51.100.10",
     "hostname": "sample-vpn",
     "ping": 42,
     "speed": 987654,
     "score": 12345,
+    "sessions": 2,
+    "owner": "Example ISP",
+    "asn": "AS64500",
+    "as_name": "EXAMPLE-NET",
+    "location": "Japan Tokyo",
+    "ip_type": "residential",
+    "quality": "normal",
+    "latency_ms": 42,
     "config_file": "vpngate_data/configs/jp-198-51-100-10.ovpn",
+    "proto": "tcp",
     "remote_host": "198.51.100.10",
     "remote_port": 443,
     "remote_proto": "tcp",
-    "probe_status": "ok"
+    "probe_status": "available",
+    "probe_message": "fixture probe",
+    "fetched_at": 1760000000,
+    "probed_at": 1760000010
   }
 ]
