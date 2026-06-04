@@ -53,13 +53,14 @@ func TestWriteConfigNormalizesConfig(t *testing.T) {
 
 func TestBuildCommandIncludesParityFlagsAndTCPProxy(t *testing.T) {
 	t.Setenv("OPENVPN_UPSTREAM_SOCKS", "127.0.0.1:1080")
-	exe, args := BuildCommand(config.Config{OpenVPNCmd: "openvpn"}, "/tmp/auth.txt", CommandOptions{
+	fakeOpenVPN := fakeOpenVPNVersion(t, "OpenVPN 2.6.9 x86_64-pc-linux-gnu\n")
+	exe, args := BuildCommand(config.Config{OpenVPNCmd: fakeOpenVPN}, "/tmp/auth.txt", CommandOptions{
 		ConfigPath:  "/tmp/node.ovpn",
 		Device:      "tun7",
 		RouteNoPull: true,
 		ConfigText:  "client\nproto tcp\nremote 198.51.100.10 443\n",
 	})
-	if exe != "openvpn" {
+	if exe != fakeOpenVPN {
 		t.Fatalf("exe = %q", exe)
 	}
 	joined := strings.Join(args, " ")
@@ -83,10 +84,33 @@ func TestBuildCommandIncludesParityFlagsAndTCPProxy(t *testing.T) {
 	}
 }
 
+func TestBuildCommandUsesNCPCiphersForOpenVPN24(t *testing.T) {
+	fakeOpenVPN := fakeOpenVPNVersion(t, "OpenVPN 2.4.12 x86_64-pc-linux-gnu\n")
+	_, args := BuildCommand(config.Config{OpenVPNCmd: fakeOpenVPN}, "/tmp/auth.txt", CommandOptions{ConfigPath: "/tmp/node.ovpn"})
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--ncp-ciphers") {
+		t.Fatalf("ncp-ciphers missing:\n%s", joined)
+	}
+	if strings.Contains(joined, "--data-ciphers") {
+		t.Fatalf("data-ciphers should not be used for 2.4:\n%s", joined)
+	}
+}
+
+func TestDetectOpenVPNVersionDefaultsTo24OnFailure(t *testing.T) {
+	resetVersionCache(t)
+	if got := DetectOpenVPNVersion(config.Config{OpenVPNCmd: filepath.Join(t.TempDir(), "missing-openvpn")}); got != "2.4" {
+		t.Fatalf("version = %q", got)
+	}
+}
+
 func TestProbeReportsReadinessDiagnostics(t *testing.T) {
 	dir := t.TempDir()
 	fakeOpenVPN := filepath.Join(dir, "fake-openvpn")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenVPN 2.6.0'
+  exit 0
+fi
 printf '%s\n' 'AUTH_FAILED' >&2
 `
 	if err := os.WriteFile(fakeOpenVPN, []byte(script), 0o755); err != nil {
@@ -108,6 +132,10 @@ func TestProbeTimeoutReportsDiagnostic(t *testing.T) {
 	dir := t.TempDir()
 	fakeOpenVPN := filepath.Join(dir, "fake-openvpn")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenVPN 2.6.0'
+  exit 0
+fi
 sleep 5
 `
 	if err := os.WriteFile(fakeOpenVPN, []byte(script), 0o755); err != nil {
@@ -146,10 +174,25 @@ func TestDiagnoseOpenVPNTunOpenedIsNotFailure(t *testing.T) {
 	}
 }
 
+func TestDiagnoseOpenVPNNodeUnreachableAndUnknown(t *testing.T) {
+	handled, err := diagnoseOpenVPNLine("TCP: connect to [AF_INET]203.0.113.10:443 failed: Connection refused")
+	if !handled || err == nil || !strings.Contains(err.Error(), "[2004] ERR_OVPN_NODE_UNREACHABLE") {
+		t.Fatalf("unexpected unreachable diagnosis handled=%v err=%v", handled, err)
+	}
+	handled, err = diagnoseOpenVPNLine("Exiting due to fatal error")
+	if !handled || err == nil || !strings.Contains(err.Error(), "[2010] ERR_OVPN_UNKNOWN") {
+		t.Fatalf("unexpected unknown diagnosis handled=%v err=%v", handled, err)
+	}
+}
+
 func TestStartKeepsProcessAfterCallerContextIsCanceled(t *testing.T) {
 	dir := t.TempDir()
 	fakeOpenVPN := filepath.Join(dir, "fake-openvpn")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenVPN 2.6.0'
+  exit 0
+fi
 printf '%s\n' 'Initialization Sequence Completed'
 trap 'exit 0' INT TERM
 while true; do sleep 1; done
@@ -175,4 +218,62 @@ while true; do sleep 1; done
 	if !manager.Running() {
 		t.Fatal("OpenVPN process stopped when caller context was canceled")
 	}
+}
+
+func TestKillOrphanProcessesRunsExpectedPkillPatterns(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "pkill.log")
+	pkill := filepath.Join(dir, "pkill")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+exit 0
+`
+	if err := os.WriteFile(pkill, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := KillOrphanProcesses(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{"-f openvpn.*tun0", "-f openvpn.*vpngate_data"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("pkill log missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func fakeOpenVPNVersion(t *testing.T, versionOutput string) string {
+	t.Helper()
+	resetVersionCache(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake-openvpn")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s' "` + versionOutput + `"
+  exit 0
+fi
+exit 0
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func resetVersionCache(t *testing.T) {
+	t.Helper()
+	versionMu.Lock()
+	old := versionCache
+	versionCache = map[string]string{}
+	versionMu.Unlock()
+	t.Cleanup(func() {
+		versionMu.Lock()
+		versionCache = old
+		versionMu.Unlock()
+	})
 }

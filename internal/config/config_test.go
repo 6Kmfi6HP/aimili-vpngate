@@ -27,6 +27,9 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.AutoConnect {
 		t.Fatal("AutoConnect default is false")
 	}
+	if !cfg.IPEnrichment {
+		t.Fatal("IPEnrichment default is false")
+	}
 }
 
 func TestLoadEnvironmentOverrides(t *testing.T) {
@@ -39,6 +42,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 	t.Setenv("MAX_SCAN_ROWS", "7")
 	t.Setenv("LOCAL_PROXY_OUTBOUND_DEVICE", "none")
 	t.Setenv("AIMILIVPN_AUTOCONNECT", "false")
+	t.Setenv("AIMILIVPN_IP_ENRICHMENT", "false")
 	cfg := Load("test")
 	if cfg.DataDir != dir {
 		t.Fatalf("DataDir = %q, want %q", cfg.DataDir, dir)
@@ -57,6 +61,9 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.AutoConnect {
 		t.Fatal("AutoConnect override not applied")
+	}
+	if cfg.IPEnrichment {
+		t.Fatal("IPEnrichment override not applied")
 	}
 }
 

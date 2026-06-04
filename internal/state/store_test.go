@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStoreEnsureAndUIConfig(t *testing.T) {
@@ -117,6 +118,58 @@ func TestSaveUIConfigPreservesUnknownFields(t *testing.T) {
 		if !containsString(string(raw), want) {
 			t.Fatalf("saved config missing %s:\n%s", want, raw)
 		}
+	}
+}
+
+func TestMigrationBackupIncludesIPCache(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.IPCacheFile(), []byte(`{"203.0.113.10":{"owner":"Example"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureMigrationBackup(); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "backups", "go-migration-*", "ip_cache.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("ip cache backup missing: %#v", matches)
+	}
+}
+
+func TestCleanupOldLogsDeletesOldDatedAndInvalidJSONFiles(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	logsDir := filepath.Join(store.Dir(), "logs")
+	oldDated := filepath.Join(logsDir, time.Now().AddDate(0, 0, -5).Format("2006-01-02")+".json")
+	freshDated := filepath.Join(logsDir, time.Now().Format("2006-01-02")+".json")
+	oldInvalid := filepath.Join(logsDir, "not-a-date.json")
+	for _, path := range []string{oldDated, freshDated, oldInvalid} {
+		if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().AddDate(0, 0, -6)
+	if err := os.Chtimes(oldInvalid, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CleanupOldLogs(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{oldDated, oldInvalid} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be deleted, err=%v", path, err)
+		}
+	}
+	if _, err := os.Stat(freshDated); err != nil {
+		t.Fatalf("fresh log should remain: %v", err)
 	}
 }
 

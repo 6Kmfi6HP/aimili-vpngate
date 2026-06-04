@@ -13,22 +13,48 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	diag "github.com/6Kmfi6HP/aimili-vpngate/internal/diagnostics"
+)
+
+var (
+	commandRunner    = runCommand
+	policyRetryDelay = time.Second
 )
 
 func (a *App) setupPolicyRouting(iface string) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	_ = runCommand(context.Background(), "ip", "rule", "del", "table", "100")
-	_ = runCommand(context.Background(), "ip", "route", "flush", "table", "100")
-	if err := runCommand(context.Background(), "ip", "route", "add", "default", "dev", iface, "table", "100"); err != nil {
-		return fmt.Errorf("[ERR_ROUTE_TABLE_ADD_FAILED] %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := a.setupPolicyRoutingOnce(iface); err != nil {
+			lastErr = err
+			if attempt < 3 {
+				time.Sleep(policyRetryDelay)
+				continue
+			}
+			if a.store != nil {
+				_ = a.store.AppendLog("ERROR", "Routing", err.Error())
+			}
+			return lastErr
+		}
+		return nil
 	}
-	if err := runCommand(context.Background(), "ip", "rule", "add", "oif", iface, "table", "100"); err != nil {
-		return fmt.Errorf("[ERR_ROUTE_RULE_ADD_FAILED] %w", err)
+	return lastErr
+}
+
+func (a *App) setupPolicyRoutingOnce(iface string) error {
+	_ = commandRunner(context.Background(), "ip", "rule", "del", "table", "100")
+	_ = commandRunner(context.Background(), "ip", "route", "flush", "table", "100")
+	if err := commandRunner(context.Background(), "ip", "route", "add", "default", "dev", iface, "table", "100"); err != nil {
+		return fmt.Errorf("%s: %w", diag.Format(diag.ErrRouteTableAddFailed, diag.TagRouteTableAddFailed, "policy routing table setup failed"), err)
+	}
+	if err := commandRunner(context.Background(), "ip", "rule", "add", "oif", iface, "table", "100"); err != nil {
+		return fmt.Errorf("%s: %w", diag.Format(diag.ErrRouteRuleAddFailed, diag.TagRouteRuleAddFailed, "policy routing rule setup failed"), err)
 	}
 	for _, target := range []string{"all", "default", iface} {
-		_ = runCommand(context.Background(), "sysctl", "-w", "net.ipv4.conf."+target+".rp_filter=2")
+		_ = commandRunner(context.Background(), "sysctl", "-w", "net.ipv4.conf."+target+".rp_filter=2")
 	}
 	return nil
 }
@@ -37,8 +63,8 @@ func (a *App) cleanupPolicyRouting() {
 	if runtime.GOOS != "linux" {
 		return
 	}
-	_ = runCommand(context.Background(), "ip", "rule", "del", "table", "100")
-	_ = runCommand(context.Background(), "ip", "route", "flush", "table", "100")
+	_ = commandRunner(context.Background(), "ip", "rule", "del", "table", "100")
+	_ = commandRunner(context.Background(), "ip", "route", "flush", "table", "100")
 }
 
 func (a *App) checkProxyHealth(ctx context.Context) map[string]any {
@@ -47,7 +73,7 @@ func (a *App) checkProxyHealth(ctx context.Context) map[string]any {
 	}
 	if runtime.GOOS == "linux" && a.ovpn.Running() && a.cfg.LocalProxyOutboundDevice != "" {
 		if _, err := os.Stat("/sys/class/net/" + a.cfg.LocalProxyOutboundDevice); err != nil {
-			return map[string]any{"ok": false, "ip": "-", "latency_ms": 0, "error": "[ERR_ROUTE_DEV_NOT_FOUND] VPN tunnel device is not available"}
+			return map[string]any{"ok": false, "ip": "-", "latency_ms": 0, "error": diag.Format(diag.ErrRouteDevNotFound, diag.TagRouteDevNotFound, "VPN tunnel device is not available")}
 		}
 	}
 	proxyURL, err := url.Parse("http://" + net.JoinHostPort(a.connectProxyHost(), strconv.Itoa(a.ui.ProxyPort)))

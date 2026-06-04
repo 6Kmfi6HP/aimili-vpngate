@@ -15,6 +15,7 @@ import (
 
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/config"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/diagnostics"
+	"github.com/6Kmfi6HP/aimili-vpngate/internal/enrichment"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/openvpn"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/proxy"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/state"
@@ -36,12 +37,15 @@ type App struct {
 	lastCollectorHeartbeat time.Time
 	lastProxyHeartbeat     time.Time
 	lastPingerHeartbeat    time.Time
+	lastLogCleanup         time.Time
+	startTime              time.Time
 	lastRouteError         string
 	proxyFailureCount      int
 }
 
 func New(cfg config.Config) (*App, error) {
 	store := state.NewStore(cfg.DataDir)
+	enrichment.Configure(cfg.DataDir, cfg.IPEnrichment)
 	if err := store.Ensure(); err != nil {
 		return nil, err
 	}
@@ -53,7 +57,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	logger := log.New(os.Stdout, "", log.LstdFlags)
-	app := &App{cfg: cfg, store: store, ui: ui, logger: logger}
+	app := &App{cfg: cfg, store: store, ui: ui, logger: logger, startTime: time.Now()}
 	app.ovpn = openvpn.NewManager(cfg, store.AuthFile(), logger)
 	_ = state.ReadJSON(store.NodesFile(), &app.nodes)
 	return app, nil
@@ -62,6 +66,9 @@ func New(cfg config.Config) (*App, error) {
 func (a *App) Run(ctx context.Context) error {
 	if err := a.store.EnsureWritable(); err != nil {
 		return err
+	}
+	if err := openvpn.KillOrphanProcesses(a.logger); err != nil {
+		_ = a.store.AppendLog("WARNING", "OpenVPN", err.Error())
 	}
 	if err := a.ovpn.EnsureAuthFile(); err != nil {
 		return err
@@ -170,6 +177,7 @@ func (a *App) RefreshNodes(ctx context.Context, force bool) (string, error) {
 			candidates[i].ConfigFile = path
 		}
 	}
+	a.enrichNodes(candidates)
 	checked := a.checkNodes(ctx, candidates, a.cfg.TargetValidNodes)
 	a.mu.Lock()
 	a.nodes = checked
@@ -282,6 +290,7 @@ func (a *App) TestNodes(ctx context.Context, ids []string) ([]vpngate.Node, erro
 		}
 	}
 	checked := a.checkNodes(ctx, selected, len(selected))
+	a.enrichNodes(checked)
 	a.mu.Lock()
 	for i := range a.nodes {
 		for _, updated := range checked {
@@ -320,9 +329,9 @@ func (a *App) GatewayStatus() ([]map[string]any, error) {
 		{"name": "Web management service", "status": "running", "details": fmt.Sprintf("%s:%d", a.ui.Host, a.ui.Port), "error": ""},
 		{"name": "Local proxy gateway", "status": proxyStatus, "details": fmt.Sprintf("%s:%d", a.cfg.LocalProxyHost, a.ui.ProxyPort), "error": proxyErr},
 		{"name": "OpenVPN core", "status": status(a.ovpn.Running()), "details": a.ovpn.NodeID(), "error": ""},
-		{"name": "Node refresh worker", "status": heartbeatStatus(a.lastCollectorHeartbeat, time.Duration(a.cfg.FetchIntervalSeconds)*2*time.Second), "details": heartbeatDetails(a.lastCollectorHeartbeat), "error": ""},
-		{"name": "Proxy health worker", "status": heartbeatStatus(a.lastProxyHeartbeat, 90*time.Second), "details": heartbeatDetails(a.lastProxyHeartbeat), "error": a.lastRouteError},
-		{"name": "Active latency worker", "status": heartbeatStatus(a.lastPingerHeartbeat, 30*time.Second), "details": heartbeatDetails(a.lastPingerHeartbeat), "error": ""},
+		{"name": "Node refresh worker", "status": a.heartbeatStatus(a.lastCollectorHeartbeat, time.Duration(a.cfg.FetchIntervalSeconds)*2*time.Second, 15*time.Second), "details": heartbeatDetails(a.lastCollectorHeartbeat), "error": ""},
+		{"name": "Proxy health worker", "status": a.heartbeatStatus(a.lastProxyHeartbeat, 90*time.Second, 35*time.Second), "details": heartbeatDetails(a.lastProxyHeartbeat), "error": a.lastRouteError},
+		{"name": "Active latency worker", "status": a.heartbeatStatus(a.lastPingerHeartbeat, 30*time.Second, 15*time.Second), "details": heartbeatDetails(a.lastPingerHeartbeat), "error": ""},
 	}, nil
 }
 
@@ -386,6 +395,7 @@ func (a *App) maintainLoop(ctx context.Context) {
 }
 
 func (a *App) maintainOnce(ctx context.Context) {
+	a.cleanupOldLogsHourly()
 	_, _ = a.RefreshNodes(ctx, false)
 	if !a.cfg.AutoConnect {
 		return
@@ -398,6 +408,16 @@ func (a *App) maintainOnce(ctx context.Context) {
 		return
 	}
 	_, _ = a.Connect(ctx, node.ID)
+}
+
+func (a *App) cleanupOldLogsHourly() {
+	if !a.lastLogCleanup.IsZero() && time.Since(a.lastLogCleanup) < time.Hour {
+		return
+	}
+	a.lastLogCleanup = time.Now()
+	if err := a.store.CleanupOldLogs(); err != nil {
+		_ = a.store.AppendLog("WARNING", "Logs", "log cleanup failed: "+err.Error())
+	}
 }
 
 func (a *App) selectRouteCandidate() (vpngate.Node, bool) {
@@ -475,6 +495,15 @@ func (a *App) checkNodes(ctx context.Context, nodes []vpngate.Node, targetValid 
 	return vpngate.CheckCandidatesWithProbe(ctx, nodes, targetValid, 3*time.Second, probe)
 }
 
+func (a *App) enrichNodes(nodes []vpngate.Node) {
+	if !a.cfg.IPEnrichment {
+		return
+	}
+	if err := enrichment.EnrichNodes(nodes); err != nil {
+		_ = a.store.AppendLog("WARNING", "IPEnrichment", err.Error())
+	}
+}
+
 func (a *App) uiStateFields(cfg state.UIConfig) map[string]any {
 	return map[string]any{
 		"username":      cfg.Username,
@@ -520,6 +549,13 @@ func status(ok bool) string {
 		return "running"
 	}
 	return "stopped"
+}
+
+func (a *App) heartbeatStatus(t time.Time, maxAge, startupGrace time.Duration) string {
+	if !a.startTime.IsZero() && time.Since(a.startTime) < startupGrace {
+		return "starting"
+	}
+	return heartbeatStatus(t, maxAge)
 }
 
 func heartbeatStatus(t time.Time, maxAge time.Duration) string {

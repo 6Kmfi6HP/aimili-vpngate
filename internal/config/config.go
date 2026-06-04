@@ -29,6 +29,7 @@ type Config struct {
 	DataDir                   string
 	ContainerMode             bool
 	AutoConnect               bool
+	IPEnrichment              bool
 	ProxyCheckURLs            []string
 }
 
@@ -52,6 +53,7 @@ func Load(version string) Config {
 		InvalidBackoffSeconds:     getenvInt("INVALID_BACKOFF_SECONDS", 30*60),
 		ContainerMode:             getenvBool("AIMILIVPN_CONTAINER", false),
 		AutoConnect:               getenvBool("AIMILIVPN_AUTOCONNECT", true),
+		IPEnrichment:              getenvBool("AIMILIVPN_IP_ENRICHMENT", true),
 		ProxyCheckURLs:            getenvCSV("AIMILIVPN_PROXY_CHECK_URLS", []string{"http://ip.sb", "http://api.ipify.org"}),
 	}
 	cfg.DataDir = dataDir(cfg.ContainerMode)

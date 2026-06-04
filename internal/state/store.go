@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -38,6 +39,8 @@ type LogEntry struct {
 	Message   string `json:"message"`
 }
 
+var datedLogFilePattern = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})\.json$`)
+
 func NewStore(dir string) *Store {
 	return &Store{dir: dir}
 }
@@ -64,6 +67,10 @@ func (s *Store) StateFile() string {
 
 func (s *Store) UIConfigFile() string {
 	return filepath.Join(s.dir, "ui_auth.json")
+}
+
+func (s *Store) IPCacheFile() string {
+	return filepath.Join(s.dir, "ip_cache.json")
 }
 
 func (s *Store) LogFile() string {
@@ -100,7 +107,7 @@ func (s *Store) EnsureMigrationBackup() error {
 	}
 	stamp := time.Now().Format("20060102-150405")
 	backupDir := filepath.Join(s.dir, "backups", "go-migration-"+stamp)
-	for _, path := range []string{s.UIConfigFile(), s.StateFile(), s.NodesFile(), s.AuthFile()} {
+	for _, path := range []string{s.UIConfigFile(), s.StateFile(), s.NodesFile(), s.AuthFile(), s.IPCacheFile()} {
 		if _, err := os.Stat(path); err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -248,6 +255,50 @@ func (s *Store) ReadLogs() ([]LogEntry, error) {
 		}
 	}
 	return entries, scanner.Err()
+}
+
+func (s *Store) CleanupOldLogs() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	logsDir := filepath.Join(s.dir, "logs")
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	now := time.Now()
+	cutoff := now.Add(-3 * 24 * time.Hour)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(logsDir, entry.Name())
+		fileTime, err := logFileTime(entry.Name(), path)
+		if err != nil {
+			continue
+		}
+		if fileTime.Before(cutoff) {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func logFileTime(name, path string) (time.Time, error) {
+	if match := datedLogFilePattern.FindStringSubmatch(name); match != nil {
+		if t, err := time.ParseInLocation("2006-01-02", match[1], time.Local); err == nil {
+			return t, nil
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }
 
 func ReadJSON(path string, out any) error {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/config"
+	diag "github.com/6Kmfi6HP/aimili-vpngate/internal/diagnostics"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/vpngate"
 )
 
@@ -46,8 +47,51 @@ type Manager struct {
 	logTail []string
 }
 
+var (
+	versionMu    sync.Mutex
+	versionCache = map[string]string{}
+)
+
 func NewManager(cfg config.Config, authFile string, logger Logger) *Manager {
 	return &Manager{cfg: cfg, auth: authFile, logger: logger}
+}
+
+func DetectOpenVPNVersion(cfg config.Config) string {
+	parts := splitCommand(cfg.OpenVPNCmd)
+	if len(parts) == 0 {
+		parts = []string{"openvpn"}
+	}
+	key := strings.Join(parts, " ")
+	versionMu.Lock()
+	if cached := versionCache[key]; cached != "" {
+		versionMu.Unlock()
+		return cached
+	}
+	versionMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	args := append(append([]string{}, parts[1:]...), "--version")
+	out, err := exec.CommandContext(ctx, parts[0], args...).CombinedOutput()
+	version := parseOpenVPNVersion(string(out))
+	if err != nil || version == "" {
+		version = "2.4"
+	}
+
+	versionMu.Lock()
+	versionCache[key] = version
+	versionMu.Unlock()
+	return version
+}
+
+func parseOpenVPNVersion(output string) string {
+	for _, pattern := range []string{`OpenVPN\s+(\d+\.\d+(?:\.\d+)?)`, `(\d+\.\d+(?:\.\d+)?)`} {
+		match := regexp.MustCompile(pattern).FindStringSubmatch(output)
+		if len(match) == 2 {
+			return match[1]
+		}
+	}
+	return ""
 }
 
 func (m *Manager) EnsureAuthFile() error {
@@ -79,6 +123,10 @@ func BuildCommand(cfg config.Config, authFile string, opts CommandOptions) (stri
 		device = "tun0"
 	}
 	args := append([]string{}, parts[1:]...)
+	cipherFlag := "--data-ciphers"
+	if !openVPNAtLeast(DetectOpenVPNVersion(cfg), 2, 5) {
+		cipherFlag = "--ncp-ciphers"
+	}
 	args = append(args,
 		"--config", opts.ConfigPath,
 		"--dev", device,
@@ -90,7 +138,7 @@ func BuildCommand(cfg config.Config, authFile string, opts CommandOptions) (stri
 		"--connect-timeout", "15",
 		"--auth-user-pass", authFile,
 		"--auth-nocache",
-		"--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
+		cipherFlag, "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 		"--verb", "3",
 	)
 	if strings.Contains(strings.ToLower(opts.ConfigText), "proto tcp") || remoteLineUsesTCP(opts.ConfigText) {
@@ -106,6 +154,54 @@ func BuildCommand(cfg config.Config, authFile string, opts CommandOptions) (stri
 		args = append(args, "--route-nopull")
 	}
 	return parts[0], args
+}
+
+func openVPNAtLeast(version string, major, minor int) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	gotMajor, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	gotMinor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	if gotMajor != major {
+		return gotMajor > major
+	}
+	return gotMinor >= minor
+}
+
+func KillOrphanProcesses(loggers ...Logger) error {
+	var logger Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
+	var errs []error
+	for _, pattern := range []string{"openvpn.*tun0", "openvpn.*vpngate_data"} {
+		out, err := exec.Command("pkill", "-f", pattern).CombinedOutput()
+		msg := strings.TrimSpace(string(out))
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				if logger != nil {
+					logger.Printf("orphan cleanup: no process matched %s", pattern)
+				}
+				continue
+			}
+			errs = append(errs, fmt.Errorf("pkill %s: %w", pattern, err))
+			if logger != nil {
+				logger.Printf("orphan cleanup failed for %s: %v %s", pattern, err, msg)
+			}
+			continue
+		}
+		if logger != nil {
+			logger.Printf("orphan cleanup ran for %s: %s", pattern, msg)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func NormalizeConfig(configText string) string {
@@ -204,7 +300,7 @@ func (m *Manager) Start(ctx context.Context, node vpngate.Node, configPath strin
 		return err
 	case <-time.After(time.Duration(m.cfg.OpenVPNTestTimeoutSeconds) * time.Second):
 		m.Stop()
-		return fmt.Errorf("[ERR_OVPN_TIMEOUT] openvpn timeout after %ds", m.cfg.OpenVPNTestTimeoutSeconds)
+		return fmt.Errorf("%s", diag.Format(diag.ErrOpenVPNNodeUnreachable, diag.TagOpenVPNNodeUnreachable, fmt.Sprintf("[ERR_OVPN_TIMEOUT] openvpn timeout after %ds", m.cfg.OpenVPNTestTimeoutSeconds)))
 	case <-ctx.Done():
 		m.Stop()
 		return ctx.Err()
@@ -252,7 +348,7 @@ func (m *Manager) Probe(ctx context.Context, node vpngate.Node, configPath, devi
 		}
 		return ProbeResult{OK: true, Message: "OpenVPN readiness probe succeeded"}
 	case <-runCtx.Done():
-		return ProbeResult{Message: fmt.Sprintf("[ERR_OVPN_TIMEOUT] openvpn probe timeout after %s", timeout)}
+		return ProbeResult{Message: diag.Format(diag.ErrOpenVPNNodeUnreachable, diag.TagOpenVPNNodeUnreachable, fmt.Sprintf("[ERR_OVPN_TIMEOUT] openvpn probe timeout after %s", timeout))}
 	}
 }
 
@@ -359,7 +455,7 @@ func (m *Manager) watchStreams(stdout, stderr io.Reader, ready chan<- error) {
 				return
 			}
 		}
-		ready <- errors.New("openvpn exited before readiness")
+		ready <- errors.New(diag.Format(diag.ErrOpenVPNUnknown, diag.TagOpenVPNUnknown, "openvpn exited before readiness"))
 	}
 }
 
@@ -371,20 +467,28 @@ func diagnoseOpenVPNLine(line string) (bool, error) {
 	case strings.Contains(lower, "net_iface_up: set ") && strings.HasSuffix(lower, " up"):
 		return true, nil
 	case strings.Contains(line, "AUTH_FAILED"):
-		return true, errors.New("[ERR_OVPN_AUTH_FAILED] OpenVPN authentication failed")
+		return true, errors.New(diag.Format(diag.ErrOpenVPNAuthFailed, diag.TagOpenVPNAuthFailed, "OpenVPN authentication failed"))
 	case strings.Contains(line, "TLS Error") || strings.Contains(lower, "tls key negotiation failed"):
-		return true, errors.New("[ERR_OVPN_TLS_BLOCKED] OpenVPN TLS error")
+		return true, errors.New(diag.Format(diag.ErrOpenVPNTLSBlocked, diag.TagOpenVPNTLSBlocked, "OpenVPN TLS error"))
 	case strings.Contains(line, "OPTIONS ERROR"):
-		return true, fmt.Errorf("[ERR_OVPN_OPTIONS] %s", line)
+		return true, fmt.Errorf("%s", diag.Format(diag.ErrOpenVPNOptions, diag.TagOpenVPNOptions, line))
 	case strings.Contains(line, "process-push-msg-failed"):
-		return true, errors.New("[ERR_OVPN_PUSH_OPTIONS] OpenVPN failed to apply pushed options")
-	case strings.Contains(lower, "cannot resolve host address"):
-		return true, errors.New("[ERR_OVPN_DNS_RESOLVE] OpenVPN could not resolve node host")
+		return true, errors.New(diag.Format(diag.ErrOpenVPNPushOptions, diag.TagOpenVPNPushOptions, "OpenVPN failed to apply pushed options"))
+	case strings.Contains(lower, "cannot resolve host address") || strings.Contains(lower, "resolve: host name"):
+		return true, errors.New(diag.Format(diag.ErrOpenVPNDNSResolve, diag.TagOpenVPNDNSResolve, "OpenVPN could not resolve node host"))
+	case strings.Contains(lower, "connection timed out") ||
+		strings.Contains(lower, "connection timeout") ||
+		strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "network is unreachable") ||
+		strings.Contains(lower, "no route to host"):
+		return true, errors.New(diag.Format(diag.ErrOpenVPNNodeUnreachable, diag.TagOpenVPNNodeUnreachable, "OpenVPN node is unreachable"))
 	case strings.Contains(lower, "failed to open tun/tap") ||
 		strings.Contains(lower, "cannot ioctl tunsetiff") ||
 		strings.Contains(lower, "cannot open tun") ||
 		(strings.Contains(lower, "operation not permitted") && (strings.Contains(lower, "tun") || strings.Contains(lower, "tap") || strings.Contains(lower, "net_admin"))):
-		return true, errors.New("[ERR_OVPN_TUN_NOT_AVAILABLE] OpenVPN failed to open tun/tap interface")
+		return true, errors.New(diag.Format(diag.ErrOpenVPNTunUnavailable, diag.TagOpenVPNTunUnavailable, "OpenVPN failed to open tun/tap interface"))
+	case strings.Contains(lower, "exiting due to fatal error") || strings.Contains(lower, "fatal error"):
+		return true, errors.New(diag.Format(diag.ErrOpenVPNUnknown, diag.TagOpenVPNUnknown, line))
 	default:
 		return false, nil
 	}
@@ -466,7 +570,7 @@ func parseProxyValue(defaultKind, value string) (kind, host, port string) {
 
 func diagnoseStartError(err error) string {
 	if errors.Is(err, exec.ErrNotFound) {
-		return "[ERR_OVPN_CMD_NOT_FOUND] openvpn command not found"
+		return diag.Format(diag.ErrOpenVPNCmdNotFound, diag.TagOpenVPNCmdNotFound, "openvpn command not found")
 	}
-	return "[ERR_OVPN_START_FAILED] " + err.Error()
+	return diag.Format(diag.ErrOpenVPNStartFailed, diag.TagOpenVPNStartFailed, err.Error())
 }

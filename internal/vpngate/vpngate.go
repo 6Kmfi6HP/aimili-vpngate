@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	diag "github.com/6Kmfi6HP/aimili-vpngate/internal/diagnostics"
 )
 
 type Node struct {
@@ -68,7 +70,7 @@ func (c Client) Fetch(ctx context.Context) ([]Node, error) {
 		}
 		messages = append(messages, attempt.label+": "+err.Error())
 	}
-	return nil, fmt.Errorf("%s: %s", diagnoseFetch(messages), strings.Join(messages, " | "))
+	return nil, fmt.Errorf("%s: %s", diagnoseFetch(c.APIURL, messages), strings.Join(messages, " | "))
 }
 
 type fetchAttempt struct {
@@ -159,20 +161,99 @@ func getenv(name string) string {
 	return strings.TrimSpace(strings.ReplaceAll(strings.TrimSpace(os.Getenv(name)), "\n", ""))
 }
 
-func diagnoseFetch(messages []string) string {
-	joined := strings.ToLower(strings.Join(messages, " "))
-	switch {
-	case strings.Contains(joined, "no such host"):
-		return "[ERR_LOCAL_DNS_BROKEN]"
-	case strings.Contains(joined, "certificate") || strings.Contains(joined, "tls"):
-		return "[ERR_API_TLS_INTERFERENCE]"
-	case strings.Contains(joined, "timeout") || strings.Contains(joined, "i/o timeout"):
-		return "[ERR_API_IP_BLOCKED_OR_DOWN]"
-	case strings.Contains(joined, "connection refused"):
-		return "[ERR_API_IP_BLOCKED_OR_DOWN]"
-	default:
-		return "[ERR_API_FETCH_FAILED]"
+var (
+	lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return net.DefaultResolver.LookupIPAddr(ctx, host)
 	}
+	dialAddress = func(ctx context.Context, address string) error {
+		d := net.Dialer{Timeout: 2 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return err
+		}
+		_ = conn.Close()
+		return nil
+	}
+)
+
+func diagnoseFetch(apiURL string, messages []string) string {
+	host, port := apiTarget(apiURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	dnsOK := dnsWorks(ctx)
+	apiIPs, err := lookupIPAddr(ctx, host)
+	if err != nil || len(apiIPs) == 0 {
+		if !dnsOK {
+			return diag.Format(diag.ErrLocalDNSBroken, diag.TagLocalDNSBroken, "local resolver cannot resolve external domains")
+		}
+		return diag.Format(diag.ErrAPIDomainBlocked, diag.TagAPIDomainBlocked, "cannot resolve API domain "+host)
+	}
+
+	if !tcpAny(ctx, apiIPs, port) {
+		if externalTCPWorks(ctx) {
+			return diag.Format(diag.ErrAPIIPBlockedOrDown, diag.TagAPIIPBlockedOrDown, "external TCP works but API endpoint "+host+":"+strconv.Itoa(port)+" is unreachable")
+		}
+		return diag.Format(diag.ErrVPSOutboundBlocked, diag.TagVPSOutboundBlocked, "all external TCP probes failed")
+	}
+
+	joined := strings.ToLower(strings.Join(messages, " "))
+	if strings.Contains(joined, "certificate") || strings.Contains(joined, "tls") || strings.Contains(joined, "timeout") || strings.Contains(joined, "i/o timeout") {
+		return diag.Format(diag.ErrAPITLSInterference, diag.TagAPITLSInterference, "TCP connects to API but HTTPS request failed")
+	}
+	return diag.Format(diag.ErrAPITLSInterference, diag.TagAPITLSInterference, "TCP connects to API but fetch failed")
+}
+
+func apiTarget(apiURL string) (string, int) {
+	if apiURL == "" {
+		apiURL = "https://www.vpngate.net/api/iphone/"
+	}
+	parsed, err := url.Parse(apiURL)
+	if err != nil || parsed.Hostname() == "" {
+		return "www.vpngate.net", 443
+	}
+	port := parsed.Port()
+	if port != "" {
+		if parsedPort, err := strconv.Atoi(port); err == nil && parsedPort > 0 {
+			return parsed.Hostname(), parsedPort
+		}
+	}
+	if parsed.Scheme == "http" {
+		return parsed.Hostname(), 80
+	}
+	return parsed.Hostname(), 443
+}
+
+func dnsWorks(ctx context.Context) bool {
+	for _, host := range []string{"api.ipify.org", "dns.google", "one.one.one.one"} {
+		if ips, err := lookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func tcpAny(ctx context.Context, ips []net.IPAddr, port int) bool {
+	for _, ip := range ips {
+		if err := dialAddress(ctx, net.JoinHostPort(ip.IP.String(), strconv.Itoa(port))); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func externalTCPWorks(ctx context.Context) bool {
+	for _, target := range []string{
+		net.JoinHostPort("8.8.8.8", "443"),
+		net.JoinHostPort("1.1.1.1", "443"),
+		net.JoinHostPort("2001:4860:4860::8888", "443"),
+		net.JoinHostPort("2606:4700:4700::1111", "443"),
+	} {
+		if err := dialAddress(ctx, target); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func ParseAPI(text string) ([]Node, error) {

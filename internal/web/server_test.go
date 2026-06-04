@@ -229,6 +229,28 @@ func TestTestNodesCallsBackend(t *testing.T) {
 	}
 }
 
+func TestLogsEnsureDiagnosticCodes(t *testing.T) {
+	backend := &fakeBackend{
+		cfg:  state.UIConfig{SecretPath: "secret", Username: "admin"},
+		logs: []state.LogEntry{{Timestamp: "2026-01-02 03:04:05", Level: "ERROR", Module: "VPN", Message: "[ERR_OVPN_NODE_UNREACHABLE] timeout"}},
+	}
+	server := httptest.NewServer(New(backend))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/secret/api/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var logsBody map[string][]state.LogEntry
+	if err := json.NewDecoder(resp.Body).Decode(&logsBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(logsBody["logs"]) != 1 || !strings.Contains(logsBody["logs"][0].Message, "[2004] ERR_OVPN_NODE_UNREACHABLE") {
+		t.Fatalf("log diagnostic code missing: %#v", logsBody)
+	}
+}
+
 func TestIndexHTMLRendersStructuredGatewayAndLogs(t *testing.T) {
 	for _, want := range []string{"Gateway Status", "id=\"services\"", "id=\"logRows\"", "services.innerHTML", "logRows.innerHTML", "runAction"} {
 		if !strings.Contains(indexHTML, want) {

@@ -2,12 +2,16 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/config"
+	"github.com/6Kmfi6HP/aimili-vpngate/internal/state"
 	"github.com/6Kmfi6HP/aimili-vpngate/internal/vpngate"
 )
 
@@ -37,6 +41,10 @@ func TestCheckNodesSerializesProbeBatches(t *testing.T) {
 	dir := t.TempDir()
 	fakeOpenVPN := filepath.Join(dir, "fake-openvpn")
 	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenVPN 2.6.0'
+  exit 0
+fi
 lock="${AIMILIVPN_TEST_LOCK}"
 log="${AIMILIVPN_TEST_LOG}"
 if mkdir "$lock" 2>/dev/null; then
@@ -98,5 +106,61 @@ sleep 0.05
 	}
 	if len(raw) > 0 {
 		t.Fatalf("probe batches overlapped:\n%s", raw)
+	}
+}
+
+func TestSetupPolicyRoutingRetriesTransientFailures(t *testing.T) {
+	oldRunner := commandRunner
+	oldDelay := policyRetryDelay
+	policyRetryDelay = time.Millisecond
+	routeAddAttempts := 0
+	commandRunner = func(_ context.Context, name string, args ...string) error {
+		if name == "ip" && strings.Join(args, " ") == "route add default dev tun0 table 100" {
+			routeAddAttempts++
+			if routeAddAttempts < 3 {
+				return errors.New("transient route failure")
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		commandRunner = oldRunner
+		policyRetryDelay = oldDelay
+	})
+
+	app := &App{store: state.NewStore(t.TempDir())}
+	if err := app.store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.setupPolicyRouting("tun0"); err != nil {
+		t.Fatal(err)
+	}
+	if routeAddAttempts != 3 {
+		t.Fatalf("route add attempts = %d", routeAddAttempts)
+	}
+}
+
+func TestHeartbeatStatusUsesStartupGrace(t *testing.T) {
+	app, err := New(config.Config{
+		DataDir:        t.TempDir(),
+		UIHost:         "127.0.0.1",
+		UIPort:         8787,
+		LocalProxyPort: 7928,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.startTime.IsZero() {
+		t.Fatal("startTime was not recorded")
+	}
+	if got := app.heartbeatStatus(time.Now(), time.Second, 15*time.Second); got != "starting" {
+		t.Fatalf("startup heartbeat = %q", got)
+	}
+	app.startTime = time.Now().Add(-40 * time.Second)
+	if got := app.heartbeatStatus(time.Now(), time.Second, 15*time.Second); got != "running" {
+		t.Fatalf("fresh heartbeat = %q", got)
+	}
+	if got := app.heartbeatStatus(time.Now().Add(-2*time.Second), time.Second, 15*time.Second); got != "stopped" {
+		t.Fatalf("stale heartbeat = %q", got)
 	}
 }

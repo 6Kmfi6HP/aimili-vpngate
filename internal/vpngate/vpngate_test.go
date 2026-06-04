@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -191,6 +192,80 @@ func TestFetchTextSupportsSOCKSUpstreamProxy(t *testing.T) {
 	}
 	if !strings.Contains(text, "OpenVPN_ConfigData_Base64") {
 		t.Fatalf("unexpected response body: %q", text)
+	}
+}
+
+func TestDiagnoseFetchUsesActiveProbes(t *testing.T) {
+	cases := []struct {
+		name   string
+		lookup func(context.Context, string) ([]net.IPAddr, error)
+		dial   func(context.Context, string) error
+		want   string
+	}{
+		{
+			name: "local DNS broken",
+			lookup: func(context.Context, string) ([]net.IPAddr, error) {
+				return nil, errors.New("dns down")
+			},
+			dial: func(context.Context, string) error { return errors.New("offline") },
+			want: "[1006] ERR_LOCAL_DNS_BROKEN",
+		},
+		{
+			name: "api domain blocked",
+			lookup: func(_ context.Context, host string) ([]net.IPAddr, error) {
+				if host == "api.example" {
+					return nil, errors.New("api blocked")
+				}
+				return []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, nil
+			},
+			dial: func(context.Context, string) error { return nil },
+			want: "[1007] ERR_API_DOMAIN_BLOCKED",
+		},
+		{
+			name: "api ip blocked",
+			lookup: func(context.Context, string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+			},
+			dial: func(_ context.Context, address string) error {
+				if strings.HasPrefix(address, "8.8.8.8:") {
+					return nil
+				}
+				return errors.New("blocked")
+			},
+			want: "[1008] ERR_API_IP_BLOCKED_OR_DOWN",
+		},
+		{
+			name: "vps offline",
+			lookup: func(context.Context, string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+			},
+			dial: func(context.Context, string) error { return errors.New("offline") },
+			want: "[1009] ERR_VPS_OUTBOUND_BLOCKED",
+		},
+		{
+			name: "tls interference",
+			lookup: func(context.Context, string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+			},
+			dial: func(context.Context, string) error { return nil },
+			want: "[1010] ERR_API_TLS_INTERFERENCE",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			oldLookup := lookupIPAddr
+			oldDial := dialAddress
+			lookupIPAddr = tc.lookup
+			dialAddress = tc.dial
+			t.Cleanup(func() {
+				lookupIPAddr = oldLookup
+				dialAddress = oldDial
+			})
+			got := diagnoseFetch("https://api.example/vpn", []string{"https: timeout"})
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("diagnoseFetch = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
